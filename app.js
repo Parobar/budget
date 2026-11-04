@@ -478,8 +478,21 @@ function vPlan(){
 
 /* ---------- Бюджет: план и факт ---------- */
 // План лежит в settings.mb: {inc:[{n,v}], exp:{ключ статьи: сумма}}. S.mb — несохранённая правка.
+// Если план ещё не сохраняли, заполняем его из регулярных доходов, лимитов и регулярных платежей
+function mbDefault(){
+  const t0=today(),live=S.recurring.filter(r=>r.active&&!(r.end&&r.end<t0)),pm=r=>r.amount*(PER_MONTH[r.freq]||1);
+  const inc=live.filter(r=>r.kind==="income").map(r=>({n:r.note||r.cat||"Доход",v:Math.round(pm(r)*100)/100}));
+  const rec={};live.filter(r=>r.kind==="expense").forEach(r=>rec[r.cat]=(rec[r.cat]||0)+pm(r));
+  const lims=S.settings.limits||{},exp={};
+  [...new Set([...Object.keys(lims),...Object.keys(rec)])].forEach(c=>{
+    const v=Math.max(num(lims[c]),rec[c]||0);if(!v)return;
+    const k=mbGroup(c);exp[k]=Math.round(((exp[k]||0)+v)*100)/100;
+  });
+  return {inc,exp};
+}
+const mbGroup=c=>(MB_GROUPS.find(x=>x[2]&&x[2].test(c||""))||["other"])[0];
 function mbPlan(){
-  const p=S.mb||S.settings.mb||{};
+  const p=S.mb||S.settings.mb||mbDefault();
   return {inc:(p.inc&&p.inc.length?p.inc:[{n:"",v:""}]).map(x=>({...x})),exp:{...(p.exp||{})}};
 }
 function mbRead(){
@@ -491,13 +504,16 @@ function mbRead(){
 function mbFact(m){
   const st=monthStats(m),f={};
   MB_GROUPS.forEach(([k])=>f[k]=0);
-  Object.entries(st.cats).forEach(([c,v])=>{const gr=MB_GROUPS.find(x=>x[2]&&x[2].test(c||""));f[gr?gr[0]:"other"]+=v});
+  Object.entries(st.cats).forEach(([c,v])=>{f[mbGroup(c)]+=v});
   f.credit+=st.debtPaid;
   return {income:st.income,f,spend:Object.values(f).reduce((s,v)=>s+v,0)};
 }
 function mbSummary(p,fact){
   const inc=p.inc.reduce((s,x)=>s+num(x.v),0),spend=MB_GROUPS.reduce((s,[k])=>s+num(p.exp[k]),0),free=inc-spend;
   const ff=fact.income-fact.spend,rate=inc>0?Math.round(free/inc*100):0;
+  // Должно накопиться: план доходов минус по каждой статье больший из плана и факта (перерасход уменьшает накопления)
+  const incF=inc||fact.income,will=incF-MB_GROUPS.reduce((s,[k])=>s+Math.max(num(p.exp[k]),fact.f[k]),0);
+  const over=MB_GROUPS.reduce((s,[k])=>s+Math.max(0,fact.f[k]-num(p.exp[k])),0);
   const cell=(v,cls)=>`<b class="num ${cls||""}" style="text-align:right">${money(v)}</b>`;
   return `<div class="pf">
       <span></span><span class="lab" style="text-align:right">План</span><span class="lab" style="text-align:right">${esc(monthName(S.month,true))}, факт</span>
@@ -505,6 +521,7 @@ function mbSummary(p,fact){
       <span>Уходит</span>${cell(spend,"neg")}${cell(fact.spend,"neg")}
       <span><b>Можно копить</b></span>${cell(free,free<0?"neg":"pos")}${cell(ff,ff<0?"neg":"pos")}
     </div>
+    <div class="kv" style="border-top:1px solid var(--line);padding-top:10px;align-items:baseline"><span><b>Должно накопиться</b><div class="note">если дальше тратить в пределах плана${over?`, с учётом перерасхода ${esc(money(over))}`:""}</div></span><b class="num ${will<0?"neg":"pos"}" style="font:600 22px var(--f-display)">${money(will)}</b></div>
     ${inc>0?`<div class="bar ${free<0?"over":rate<10?"warn":""}"><i style="width:${Math.min(100,spend/inc*100)}%"></i></div>
     <div class="note">${free<0?`<span class="neg">По плану расходы больше доходов на ${esc(money(-free))}.</span>`:`По плану на жизнь уходит ${100-rate}% дохода, копить можно ${rate}%.`}${rate>=0&&rate<10&&free>=0?" Это мало: советуют откладывать от 10%.":""}</div>`
     :`<div class="note">Впишите доходы семьи ниже, и здесь появится, сколько можно копить.</div>`}`;
@@ -523,15 +540,49 @@ function vMb(){
     const pl=num(p.exp[k]),f=fact.f[k];
     const pct=pl?Math.min(100,f/pl*100):0,cls=pl&&f>pl?"over":(pl&&f>pl*.85?"warn":"");
     const noCat=re&&k!=="credit"&&!cats.some(c=>re.test(c));
-    return `<div class="lim"><div style="min-width:0"><div>${esc(label)}</div>
-      <div class="s muted num" style="font-size:12px">${esc(mn)}: ${money(f)}${pl?` из ${nf.format(pl)}`:""}</div>
+    return `<div class="lim"><div style="min-width:0"><div><b>${esc(label)}</b>${k==="credit"?` <span class="note">(списываются сами)</span>`:""}</div>
+      <div class="s muted num" style="font-size:12px">потрачено ${money(f)}${pl?` · ${f>pl?`<span class="neg">перерасход ${money(f-pl)}</span>`:`осталось <span class="pos">${money(pl-f)}</span>`}`:""}</div>
       ${pl?`<div class="bar ${cls}" style="margin-top:5px"><i style="width:${pct}%"></i></div>`:""}
+      ${S.readOnly||k==="credit"?"":`<button class="btn ghost sm" style="margin-top:8px" data-act="mb-spend" data-k="${k}">+ Потратил</button>`}
       ${noCat?`<div class="note" style="font-size:12px">Нет такой категории для операций. Добавьте «${esc(label)}» в «Ещё» → «Категории».</div>`:""}</div>
       <input type="number" inputmode="decimal" min="0" step="any" data-mbe="${k}" value="${esc(p.exp[k]??"")}" placeholder="0" aria-label="План: ${esc(label)}" ${ro}></div>`;
   }).join("")+`</div>`;
   if(!S.readOnly)h+=`<div style="margin-top:14px"><button class="btn block" data-act="save-mb">Сохранить план</button>${S.mb?`<div class="note" style="text-align:center;margin-top:6px">Есть несохранённые изменения</div>`:""}</div>`;
   h+=`<div class="note" style="margin-top:10px">План один на все месяцы, его видят все в семье. Факт считается по операциям выбранного месяца: категории попадают в статьи по названию, переводы на кредитные счета идут в «Кредиты», всё прочее — в «Остальное».</div>`;
   return h;
+}
+function mbCats(k){
+  const cats=catList("expense"),re=MB_GROUPS.find(x=>x[0]===k)?.[2];
+  const list=k==="other"?cats.filter(c=>mbGroup(c)==="other"):cats.filter(c=>re&&re.test(c));
+  return list.length?list:[MB_GROUPS.find(x=>x[0]===k)[1]];
+}
+function openSpend(k){
+  const acc=[lastAcc,...S.accounts.filter(a=>!isDebt(a)).map(a=>a.id),S.accounts[0]?.id].find(id=>id&&S.accounts.some(a=>a.id===id));
+  if(!acc){toast("Сначала добавьте счёт");return openAcc()}
+  if(S.mb&&document.querySelector("[data-mbe]"))mbRead();
+  const cats=mbCats(k);
+  draft={type:"spend",k,cat:cats[0],amount:"",note:"",acc,date:S.month===ym(new Date())?today():S.month+"-01"};
+  spendSheet();
+}
+function spendSheet(){
+  const d=draft,cats=mbCats(d.k),label=MB_GROUPS.find(x=>x[0]===d.k)[1];
+  const list=S.tx.filter(t=>t.kind==="expense"&&t.date.startsWith(S.month)&&mbGroup(t.cat)===d.k);
+  sheet(`<h1 style="font:600 18px var(--f-display);margin:0 0 12px">${esc(label)}</h1>
+    <div class="fld"><label for="s-amount">Сколько потратили, ${esc(S.settings.currency)}</label><input class="amount" id="s-amount" type="number" inputmode="decimal" min="0" step="any" value="${esc(d.amount)}" placeholder="0" autofocus></div>
+    ${cats.length>1?`<div class="fld"><label for="s-cat">Категория</label><select id="s-cat">${cats.map(c=>`<option ${c===d.cat?"selected":""}>${esc(c)}</option>`).join("")}</select></div>`:""}
+    <div class="two"><div class="fld"><label for="s-acc">С какого счёта</label><select id="s-acc">${opts(d.acc,S.accounts)}</select></div>
+    <div class="fld"><label for="s-date">Дата</label><input id="s-date" type="date" value="${esc(d.date)}"></div></div>
+    <div class="fld"><label for="s-note">Заметка</label><input id="s-note" type="text" value="${esc(d.note)}" placeholder="Необязательно" maxlength="120"></div>
+    <div class="actions"><button class="btn ghost" data-act="close">Отмена</button><button class="btn" data-act="save-spend">Добавить</button></div>
+    ${list.length?`<h2>Уже потрачено за ${esc(monthName(S.month,true))}: ${esc(money(list.reduce((s,t)=>s+t.amount,0)))}</h2><div class="card" style="padding-top:2px;padding-bottom:2px">${list.slice(0,30).map(txRow).join("")}</div><p class="note">Нажмите на запись, чтобы исправить или удалить.</p>`:""}`);
+}
+async function saveSpend(){
+  syncDraft();const d=draft,amount=num(d.amount);
+  if(!(amount>0))return toast("Введите сумму больше нуля");
+  try{
+    await api.saveTx(null,{kind:"expense",amount:Math.round(amount*100)/100,date:d.date||today(),cat:d.cat,acc:d.acc,note:(d.note||"").trim(),by:S.uid||""});
+    lastAcc=d.acc;closeSheet();toast(`${d.cat}: −${money(amount)}`);
+  }catch(e){toast("Не удалось сохранить: "+(e.message||e.code))}
 }
 async function saveMb(){
   const p=mbRead(),clean={inc:[],exp:{}};
@@ -564,7 +615,7 @@ function vMore(){
 }
 
 /* ============ Формы ============ */
-const SPEC={tx:["f",["amount","date","cat","acc","to","note"]],acc:["a",["name","kind","amount","limit","rate","payment","actual"]],
+const SPEC={spend:["s",["cat","amount","acc","date","note"]],tx:["f",["amount","date","cat","acc","to","note"]],acc:["a",["name","kind","amount","limit","rate","payment","actual"]],
   rec:["r",["amount","cat","acc","to","note","freq","next","end","active"]],goal:["g",["name","target","acc","saved","deadline"]]};
 function syncDraft(){
   if(!draft||!SPEC[draft.type])return;
@@ -910,6 +961,8 @@ document.addEventListener("click",e=>{
     case "save-cats":saveCats();break;
     case "save-bud":saveBud();break;
     case "save-mb":saveMb();break;
+    case "mb-spend":openSpend(el.dataset.k);break;
+    case "save-spend":saveSpend();break;
     case "mb-inc-add":{mbRead().inc.push({n:"",v:""});render();const ins=document.querySelectorAll("[data-mbn]");ins[ins.length-1]?.focus();break}
     case "mb-inc-del":mbRead().inc.splice(Number(el.dataset.i),1);render();break;
     case "export":exportCsv();break;
