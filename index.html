@@ -149,6 +149,8 @@ h1{text-wrap:balance}
 .chk{display:flex;gap:10px;align-items:center;margin-bottom:12px}
 .chk input{width:20px;height:20px}
 nav.tabs button{font-size:11.5px}
+.pf{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px 14px;align-items:baseline}
+@media (max-width:400px){nav.tabs button{font-size:10.5px}}
 </style>
 </head>
 <body>
@@ -166,6 +168,7 @@ nav.tabs button{font-size:11.5px}
 <button class="fab" id="fab" data-act="add-tx">+ Операция</button>
 <nav class="tabs"><div class="in" id="tabs">
   <button data-tab="home">Обзор</button>
+  <button data-tab="budget">Бюджет</button>
   <button data-tab="tx">Операции</button>
   <button data-tab="acc">Счета</button>
   <button data-tab="plan">Планы</button>

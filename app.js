@@ -8,12 +8,24 @@ const TYPES={
   loan:{label:"Кредит или ипотека",debt:true,group:"Долги"}
 };
 const CATS={
-  expense:["Продукты","Дом и ЖКХ","Транспорт","Авто","Кафе и рестораны","Здоровье","Дети","Одежда","Развлечения","Связь и подписки","Путешествия","Подарки","Прочее"],
+  expense:["Продукты","Дом и ЖКХ","Транспорт","Авто","Кафе и рестораны","Здоровье","Красота","Дети","Одежда","Развлечения","Связь и подписки","Путешествия","Подарки","Прочее"],
   income:["Зарплата","Подработка","Подарки","Проценты","Возврат","Прочее"]
 };
 const CUR=["₽","$","€","₴","₸","Br","zł","£"];
 const FREQ={weekly:"Каждую неделю",monthly:"Каждый месяц",yearly:"Каждый год"};
 const KIND_RU={expense:"Расход",income:"Доход",transfer:"Перевод"};
+/* Статьи вкладки «Бюджет»: ключ, название, какие категории операций в неё попадают (по названию) */
+const MB_GROUPS=[
+  ["credit","Кредиты",/кредит|долг|ипотек|займ|рассрочк/i],
+  ["food","Продукты",/продукт/i],
+  ["clothes","Одежда",/одежд|обув/i],
+  ["transport","Транспорт",/транспорт|авто|такси|бензин|топлив|парковк/i],
+  ["gifts","Подарки",/подар/i],
+  ["beauty","Красота",/красот|космет|салон|парикмах|маникюр/i],
+  ["subs","Подписки",/подписк|связь/i],
+  ["health","Здоровье",/здоров|аптек|лекарств|врач|медиц/i],
+  ["other","Остальное",null]
+];
 
 /* ============ Утилиты ============ */
 const pad=n=>String(n).padStart(2,"0");
@@ -48,7 +60,7 @@ const shortDate=d=>pd(d).toLocaleDateString("ru-RU",{day:"numeric",month:"short"
 /* ============ Состояние ============ */
 const S={accounts:[],tx:[],recurring:[],goals:[],settings:{currency:"₽",limits:{},cats:null},
   month:ym(new Date()),tab:"home",names:{},uid:null,readOnly:false,err:null,stage:"boot",authMode:"login",
-  session:null,members:[],invite:"",loaded:false,q:"",fKind:"all",fAcc:"all",strat:"avalanche",extra:0};
+  session:null,members:[],invite:"",loaded:false,q:"",fKind:"all",fAcc:"all",strat:"avalanche",extra:0,mb:null};
 let draft=null,lastAcc=null,hh=null;
 const catList=k=>(S.settings.cats&&S.settings.cats[k]&&S.settings.cats[k].length)?S.settings.cats[k]:CATS[k];
 const accName=id=>S.accounts.find(a=>a.id===id)?.name||"—";
@@ -210,7 +222,7 @@ const delta=(cur,prev,badUp)=>{
 function render(){
   const inApp=S.stage==="app";
   document.querySelector("nav.tabs").hidden=!inApp;
-  $("#monthnav").style.visibility=(inApp&&["home","tx"].includes(S.tab))?"visible":"hidden";
+  $("#monthnav").style.visibility=(inApp&&["home","budget","tx"].includes(S.tab))?"visible":"hidden";
   $("#fab").hidden=!inApp||S.readOnly||!["home","tx","acc"].includes(S.tab);
   $("#monthlabel").textContent=monthName(S.month);
   document.querySelectorAll("#tabs button").forEach(b=>b.setAttribute("aria-current",b.dataset.tab===S.tab));
@@ -220,7 +232,7 @@ function render(){
   if(S.stage==="house"){app.innerHTML=vHouse();return}
   if(S.err){app.innerHTML=`<div class="card empty"><b>Не удалось загрузить данные</b>${esc(S.err)}<div style="margin-top:14px"><button class="btn" data-act="reload">Повторить</button></div></div>`;return}
   if(!S.loaded){app.innerHTML=`<div class="card empty">Загружаю…</div>`;return}
-  app.innerHTML=({home:vHome,tx:vTx,acc:vAcc,plan:vPlan,more:vMore}[S.tab])();
+  app.innerHTML=({home:vHome,budget:vMb,tx:vTx,acc:vAcc,plan:vPlan,more:vMore}[S.tab])();
 }
 
 function vAuth(){
@@ -462,6 +474,70 @@ function vPlan(){
   }).join("")+`</div>`;
   if(!S.readOnly)h+=`<div style="margin-top:10px"><button class="btn ghost block" data-act="add-goal">+ Цель</button></div>`;
   return h;
+}
+
+/* ---------- Бюджет: план и факт ---------- */
+// План лежит в settings.mb: {inc:[{n,v}], exp:{ключ статьи: сумма}}. S.mb — несохранённая правка.
+function mbPlan(){
+  const p=S.mb||S.settings.mb||{};
+  return {inc:(p.inc&&p.inc.length?p.inc:[{n:"",v:""}]).map(x=>({...x})),exp:{...(p.exp||{})}};
+}
+function mbRead(){
+  const p={inc:[],exp:{}};
+  document.querySelectorAll("[data-mbn]").forEach(i=>p.inc.push({n:i.value,v:g("mbv-"+i.dataset.mbn).value}));
+  document.querySelectorAll("[data-mbe]").forEach(i=>p.exp[i.dataset.mbe]=i.value);
+  S.mb=p;return p;
+}
+function mbFact(m){
+  const st=monthStats(m),f={};
+  MB_GROUPS.forEach(([k])=>f[k]=0);
+  Object.entries(st.cats).forEach(([c,v])=>{const gr=MB_GROUPS.find(x=>x[2]&&x[2].test(c||""));f[gr?gr[0]:"other"]+=v});
+  f.credit+=st.debtPaid;
+  return {income:st.income,f,spend:Object.values(f).reduce((s,v)=>s+v,0)};
+}
+function mbSummary(p,fact){
+  const inc=p.inc.reduce((s,x)=>s+num(x.v),0),spend=MB_GROUPS.reduce((s,[k])=>s+num(p.exp[k]),0),free=inc-spend;
+  const ff=fact.income-fact.spend,rate=inc>0?Math.round(free/inc*100):0;
+  const cell=(v,cls)=>`<b class="num ${cls||""}" style="text-align:right">${money(v)}</b>`;
+  return `<div class="pf">
+      <span></span><span class="lab" style="text-align:right">План</span><span class="lab" style="text-align:right">${esc(monthName(S.month,true))}, факт</span>
+      <span>Доходы семьи</span>${cell(inc,"pos")}${cell(fact.income,"pos")}
+      <span>Уходит</span>${cell(spend,"neg")}${cell(fact.spend,"neg")}
+      <span><b>Можно копить</b></span>${cell(free,free<0?"neg":"pos")}${cell(ff,ff<0?"neg":"pos")}
+    </div>
+    ${inc>0?`<div class="bar ${free<0?"over":rate<10?"warn":""}"><i style="width:${Math.min(100,spend/inc*100)}%"></i></div>
+    <div class="note">${free<0?`<span class="neg">По плану расходы больше доходов на ${esc(money(-free))}.</span>`:`По плану на жизнь уходит ${100-rate}% дохода, копить можно ${rate}%.`}${rate>=0&&rate<10&&free>=0?" Это мало: советуют откладывать от 10%.":""}</div>`
+    :`<div class="note">Впишите доходы семьи ниже, и здесь появится, сколько можно копить.</div>`}`;
+}
+function vMb(){
+  const p=mbPlan(),fact=mbFact(S.month),ro=S.readOnly?"disabled":"",mn=monthName(S.month,true);
+  const cats=catList("expense");
+  let h=`<h2>Итог месяца</h2><section class="card hero" id="mb-sum">${mbSummary(p,fact)}</section>`;
+  h+=`<h2>Доходы семьи</h2><div class="card">`+p.inc.map((x,i)=>
+    `<div class="crow"><input data-mbn="${i}" value="${esc(x.n)}" maxlength="40" placeholder="Например, зарплата мужа" aria-label="Источник дохода" ${ro}>
+    <input id="mbv-${i}" type="number" inputmode="decimal" min="0" step="any" value="${esc(x.v)}" placeholder="0" style="flex:0 0 110px;text-align:right" aria-label="Сумма в месяц" ${ro}>
+    ${S.readOnly?"":`<button class="icon" data-act="mb-inc-del" data-i="${i}" aria-label="Убрать">×</button>`}</div>`).join("")+
+    (S.readOnly?"":`<button class="link" data-act="mb-inc-add">+ Источник дохода</button>`)+
+    `<div class="note" style="margin-top:6px">Факт за ${esc(mn)}: пришло <b class="num">${money(fact.income)}</b> по операциям «Доход».</div></div>`;
+  h+=`<h2>Расходы в месяц</h2><div class="card">`+MB_GROUPS.map(([k,label,re])=>{
+    const pl=num(p.exp[k]),f=fact.f[k];
+    const pct=pl?Math.min(100,f/pl*100):0,cls=pl&&f>pl?"over":(pl&&f>pl*.85?"warn":"");
+    const noCat=re&&k!=="credit"&&!cats.some(c=>re.test(c));
+    return `<div class="lim"><div style="min-width:0"><div>${esc(label)}</div>
+      <div class="s muted num" style="font-size:12px">${esc(mn)}: ${money(f)}${pl?` из ${nf.format(pl)}`:""}</div>
+      ${pl?`<div class="bar ${cls}" style="margin-top:5px"><i style="width:${pct}%"></i></div>`:""}
+      ${noCat?`<div class="note" style="font-size:12px">Нет такой категории для операций. Добавьте «${esc(label)}» в «Ещё» → «Категории».</div>`:""}</div>
+      <input type="number" inputmode="decimal" min="0" step="any" data-mbe="${k}" value="${esc(p.exp[k]??"")}" placeholder="0" aria-label="План: ${esc(label)}" ${ro}></div>`;
+  }).join("")+`</div>`;
+  if(!S.readOnly)h+=`<div style="margin-top:14px"><button class="btn block" data-act="save-mb">Сохранить план</button>${S.mb?`<div class="note" style="text-align:center;margin-top:6px">Есть несохранённые изменения</div>`:""}</div>`;
+  h+=`<div class="note" style="margin-top:10px">План один на все месяцы, его видят все в семье. Факт считается по операциям выбранного месяца: категории попадают в статьи по названию, переводы на кредитные счета идут в «Кредиты», всё прочее — в «Остальное».</div>`;
+  return h;
+}
+async function saveMb(){
+  const p=mbRead(),clean={inc:[],exp:{}};
+  p.inc.forEach(x=>{const n=x.n.trim().slice(0,40),v=num(x.v);if(n||v>0)clean.inc.push({n,v})});
+  MB_GROUPS.forEach(([k])=>{const v=num(p.exp[k]);if(v>0)clean.exp[k]=v});
+  try{await api.saveSettings({...S.settings,mb:clean});S.mb=null;render();toast("План сохранён")}catch(e){toast("Не удалось сохранить")}
 }
 
 /* ---------- Ещё ---------- */
@@ -833,6 +909,9 @@ document.addEventListener("click",e=>{
     case "del-goal":delGoal();break;
     case "save-cats":saveCats();break;
     case "save-bud":saveBud();break;
+    case "save-mb":saveMb();break;
+    case "mb-inc-add":{mbRead().inc.push({n:"",v:""});render();const ins=document.querySelectorAll("[data-mbn]");ins[ins.length-1]?.focus();break}
+    case "mb-inc-del":mbRead().inc.splice(Number(el.dataset.i),1);render();break;
     case "export":exportCsv();break;
     case "import":g("imp-file").click();break;
     case "do-import":doImport();break;
@@ -865,6 +944,7 @@ document.addEventListener("change",e=>{
 });
 document.addEventListener("input",e=>{
   if(e.target.id==="q"){S.q=e.target.value;g("txlist").innerHTML=txListHtml()}
+  else if(S.tab==="budget"&&e.target.closest("#app")){g("mb-sum").innerHTML=mbSummary(mbRead(),mbFact(S.month))}
 });
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&draft)closeSheet()});
 
@@ -938,13 +1018,13 @@ async function loadAll(){
       sb.from("members").select("user_id,display_name")]);
     if(h.error)throw h.error;if(m.error)throw m.error;
     S.accounts=a.map(mapAcc);S.tx=t.map(mapTx);S.recurring=r.map(mapRec);S.goals=gl.map(mapGoal);S.invite=h.data.invite_code;
-    const st=h.data.settings||{};S.settings={currency:st.currency||"₽",limits:st.limits||{},cats:st.cats||null};
+    const st=h.data.settings||{};S.settings={currency:st.currency||"₽",limits:st.limits||{},cats:st.cats||null,mb:st.mb||null};
     S.members=m.data;S.names={};m.data.forEach(x=>{if(x.display_name)S.names[x.user_id]=x.display_name});
     S.err=null;S.loaded=true;
   }catch(e){
     if(!S.loaded)S.err=ruErr(e);else toast("Нет связи, данные могут быть неактуальны");
   }
-  const typing=S.tab==="more"&&document.activeElement?.matches("input,select");
+  const typing=["more","budget"].includes(S.tab)&&document.activeElement?.matches("input,select");
   const searching=S.tab==="tx"&&document.activeElement?.id==="q";
   if(!draft&&!typing&&!searching)render();
 }
