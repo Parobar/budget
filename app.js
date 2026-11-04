@@ -117,6 +117,73 @@ function simDebt(extra,strat){
   }
   return {months,interest,order,capped:months>=600,pool};
 }
+/* Бюджет на типичный месяц: доходы из регулярных операций, расходы = max(лимит, регулярные) по каждой категории + переводы в долги */
+const PER_MONTH={weekly:52/12,monthly:1,yearly:1/12};
+function monthlyPlan(){
+  const t0=today(),debtIds=new Set(S.accounts.filter(isDebt).map(a=>a.id));
+  const live=S.recurring.filter(r=>r.active&&!(r.end&&r.end<t0));
+  const pm=r=>r.amount*(PER_MONTH[r.freq]||1);
+  let income=live.filter(r=>r.kind==="income").reduce((s,r)=>s+pm(r),0),incomeSrc="rec";
+  if(!income){
+    const ms=[1,2,3].map(i=>monthStats(shiftMonth(ym(new Date()),-i)).income).filter(v=>v>0);
+    if(ms.length){income=ms.reduce((s,v)=>s+v,0)/ms.length;incomeSrc="avg"}
+  }
+  const rec={};
+  live.filter(r=>r.kind==="expense").forEach(r=>rec[r.cat]=(rec[r.cat]||0)+pm(r));
+  const debtTransfers=live.filter(r=>r.kind==="transfer"&&debtIds.has(r.to)).reduce((s,r)=>s+pm(r),0);
+  const lims=S.settings.limits||{};
+  const names=[...new Set([...catList("expense"),...Object.keys(lims),...Object.keys(rec)])];
+  const rows=names.map(c=>{const l=num(lims[c]),r=rec[c]||0;return {cat:c,lim:l,rec:r,plan:Math.max(l,r)}});
+  const planned=rows.filter(r=>r.plan>0).sort((a,b)=>b.plan-a.plan);
+  const open=rows.filter(r=>!r.plan).map(r=>r.cat);
+  // сколько в среднем уходит в категории без лимита (последние 3 полных месяца)
+  const avg={};[1,2,3].forEach(i=>{const st=monthStats(shiftMonth(ym(new Date()),-i));open.forEach(c=>{if(st.cats[c])avg[c]=(avg[c]||0)+st.cats[c]/3})});
+  const openAvg=Object.values(avg).reduce((s,v)=>s+v,0);
+  const spend=planned.reduce((s,r)=>s+r.plan,0)+debtTransfers;
+  // когда освободятся платежи по кредитам
+  const b=balances(),freed=[];
+  S.accounts.filter(a=>a.type==="loan"&&a.payment&&(b[a.id]||0)<-0.005).forEach(a=>{
+    const n=monthsLeft(-b[a.id],a.rate||0,a.payment);if(n)freed.push({name:a.name,n,pay:a.payment});
+  });
+  freed.sort((a,c)=>a.n-c.n);
+  const interest=S.accounts.filter(a=>a.type==="credit"&&a.rate&&(b[a.id]||0)<-0.005).map(a=>({name:a.name,v:-b[a.id]*a.rate/1200,rate:a.rate}));
+  return {income,incomeSrc,planned,open,openAvg,debtTransfers,spend,free:income-spend,freed,interest};
+}
+function vBudget(full){
+  const p=monthlyPlan();
+  if(!p.income&&!p.spend)return full?`<div class="card empty"><b>Бюджет пока не из чего считать</b>Добавьте регулярные доходы (зарплату) и лимиты на вкладке «Ещё».</div>`:"";
+  const rate=p.income>0?Math.round(p.free/p.income*100):0;
+  let h=`<section class="card hero">
+    <div class="trio">
+      <div><div class="lab">Доходы</div><div class="v num pos">${money(p.income)}</div></div>
+      <div><div class="lab">Уходит на жизнь</div><div class="v num neg">${money(p.spend)}</div></div>
+      <div><div class="lab">Можно копить</div><div class="v num ${p.free<0?"neg":"pos"}">${money(p.free)}</div></div>
+    </div>
+    ${p.income>0?`<div class="bar ${p.free<0?"over":rate<10?"warn":""}"><i style="width:${Math.min(100,p.spend/p.income*100)}%"></i></div>
+    <div class="note">${p.free<0?`<span class="neg">Расходы по плану больше доходов на ${esc(money(-p.free))}.</span>`:`На жизнь уходит ${100-rate}% дохода, копить можно ${rate}%.`}${rate>=0&&rate<10&&p.free>=0?" Это мало: советуют откладывать от 10%.":""}</div>`:""}
+    ${p.incomeSrc==="avg"?`<div class="note">Регулярных доходов нет, взят средний доход за 3 месяца.</div>`:""}
+  </section>`;
+  if(!full)return h;
+  const debtCats=p.planned.filter(r=>/кредит|долг|ипотек|займ/i.test(r.cat));
+  const lifeCats=p.planned.filter(r=>!debtCats.includes(r));
+  const sum=a=>a.reduce((s,r)=>s+r.plan,0);
+  const line=r=>`<div class="kv"><span>${esc(r.cat)}<div class="note">${r.lim&&r.rec?`лимит ${esc(nf.format(r.lim))}, из них регулярно ${esc(nf.format(Math.round(r.rec*100)/100))}${r.rec>r.lim?" (больше лимита)":""}`:r.lim?"лимит":"регулярные платежи"}</div></span><b class="num">${money(r.plan)}</b></div>`;
+  if(debtCats.length||p.debtTransfers){
+    h+=`<h2>Кредиты: ${esc(money(sum(debtCats)+p.debtTransfers))} в месяц</h2><div class="card">${debtCats.map(line).join("")}${p.debtTransfers?`<div class="kv"><span>Переводы в счёт долгов</span><b class="num">${money(p.debtTransfers)}</b></div>`:""}</div>`;
+  }
+  if(lifeCats.length)h+=`<h2>Жизнь: ${esc(money(sum(lifeCats)))} в месяц</h2><div class="card">${lifeCats.map(line).join("")}</div>`;
+  if(p.open.length)h+=`<div class="card note" style="margin-top:10px">Без лимита: ${esc(p.open.join(", "))}. ${p.openAvg>0?`В среднем туда уходило <b class="num">${esc(money(p.openAvg))}</b> в месяц, это вычтется из того, что можно копить.`:"Любые траты здесь уменьшают сумму, которую можно копить."}</div>`;
+  if(p.interest.length)h+=`<div class="card note" style="margin-top:10px">${p.interest.map(i=>`${esc(i.name)}: проценты около <b class="num neg">${esc(money(i.v))}</b> в месяц (${esc(String(i.rate))}% годовых).`).join("<br>")} Это самый дорогой долг, свободные деньги выгоднее всего отправлять сюда.</div>`;
+  if(p.freed.length){
+    let run=p.free,last=-1,acc=[];
+    p.freed.forEach(f=>{if(f.n!==last){acc.push({n:f.n,names:[],pay:0});last=f.n}const x=acc[acc.length-1];x.names.push(f.name);x.pay+=f.pay});
+    h+=`<h2>Когда станет свободнее</h2><div class="card">`+acc.map(x=>{run+=x.pay;
+      return `<div class="kv"><span>Через ~${esc(monthsText(x.n))} (${esc(dateAfter(x.n))})<div class="note">закроется ${esc(x.names.join(", "))}: +${esc(money(x.pay))}</div></span><b class="num ${run<0?"neg":"pos"}">${money(run)}</b></div>`}).join("")+
+      `<div class="note">Справа: сколько можно будет копить в месяц после этого.</div></div>`;
+  }
+  h+=`<div class="note" style="margin-top:8px">Считается так: по каждой категории берётся больший из лимита и регулярных платежей, плюс регулярные переводы на кредиты. Меняется автоматически, когда вы правите лимиты или регулярные операции.</div>`;
+  return h;
+}
 function monthsText(n){
   const y=Math.floor(n/12),m=n%12,p=[];
   if(y)p.push(y+" "+(y%10===1&&y!==11?"год":(y%10>=2&&y%10<=4&&(y<10||y>20))?"года":"лет"));
@@ -208,6 +275,8 @@ function vHome(){
       <div><div class="lab">Накопления</div><div class="v num pos">${money(w.savings)}</div></div>
       <div><div class="lab">Долги</div><div class="v num neg">${money(Math.abs(w.debts))}</div></div>
     </div></section>`;
+  const bud=vBudget(false);
+  if(bud)h+=`<h2>План на месяц</h2>`+bud.replace("</section>",`<button class="link" data-tab="plan" style="justify-self:start">Подробнее</button></section>`);
   h+=`<h2>${esc(monthName(S.month))}</h2><section class="card hero">
     <div class="trio">
       <div><div class="lab">Доходы</div><div class="v num pos">${money(st.income)}</div>${delta(st.income,pv.income,false)}</div>
@@ -362,7 +431,7 @@ function vAcc(){
 function goalNow(g_,b){return (g_.acc&&(g_.acc in b))?Math.max(0,b[g_.acc]):g_.saved}
 function vPlan(){
   const b=balances(),up=upcoming(30);
-  let h=`<h2>Ближайшие 30 дней</h2>`;
+  let h=`<h2>Бюджет на месяц</h2>`+vBudget(true)+`<h2>Ближайшие 30 дней</h2>`;
   if(!up.length)h+=`<div class="card empty"><b>Запланированных платежей нет</b>Добавьте регулярные операции: аренду, кредит, подписки, зарплату.</div>`;
   else{
     const out=up.filter(r=>r.kind==="expense").reduce((s,r)=>s+r.amount,0),inc=up.filter(r=>r.kind==="income").reduce((s,r)=>s+r.amount,0);
