@@ -14,6 +14,8 @@ const CATS={
 const CUR=["₽","$","€","₴","₸","Br","zł","£"];
 const FREQ={weekly:"Каждую неделю",monthly:"Каждый месяц",yearly:"Каждый год"};
 const KIND_RU={expense:"Расход",income:"Доход",transfer:"Перевод"};
+// «Возврат» (друг вернул долг, магазин вернул деньги) меняет остаток счёта, но доходом не считается
+const isRefund=c=>/^возврат/i.test(c||"");
 
 /* ============ Утилиты ============ */
 const pad=n=>String(n).padStart(2,"0");
@@ -67,11 +69,11 @@ function balances(){
   return b;
 }
 function monthStats(m){
-  const r={income:0,expense:0,debtPaid:0,cats:{},people:{}};
+  const r={income:0,refund:0,expense:0,debtPaid:0,cats:{},people:{}};
   const debt=new Set(S.accounts.filter(isDebt).map(a=>a.id));
   S.tx.forEach(t=>{
     if(!t.date.startsWith(m))return;
-    if(t.kind==="income")r.income+=t.amount;
+    if(t.kind==="income"){if(isRefund(t.cat))r.refund+=t.amount;else r.income+=t.amount}
     else if(t.kind==="expense"){r.expense+=t.amount;r.cats[t.cat]=(r.cats[t.cat]||0)+t.amount;r.people[t.by]=(r.people[t.by]||0)+t.amount}
     else if(t.kind==="transfer"&&debt.has(t.to))r.debtPaid+=t.amount;
   });
@@ -123,7 +125,7 @@ function monthlyPlan(){
   const t0=today(),debtIds=new Set(S.accounts.filter(isDebt).map(a=>a.id));
   const live=S.recurring.filter(r=>r.active&&!(r.end&&r.end<t0));
   const pm=r=>r.amount*(PER_MONTH[r.freq]||1);
-  let income=live.filter(r=>r.kind==="income").reduce((s,r)=>s+pm(r),0),incomeSrc="rec";
+  let income=live.filter(r=>r.kind==="income"&&!isRefund(r.cat)).reduce((s,r)=>s+pm(r),0),incomeSrc="rec";
   if(!income){
     const ms=[1,2,3].map(i=>monthStats(shiftMonth(ym(new Date()),-i)).income).filter(v=>v>0);
     if(ms.length){income=ms.reduce((s,v)=>s+v,0)/ms.length;incomeSrc="avg"}
@@ -281,11 +283,20 @@ function vHome(){
     <div class="trio">
       <div><div class="lab">Доходы</div><div class="v num pos">${money(st.income)}</div>${delta(st.income,pv.income,false)}</div>
       <div><div class="lab">Расходы</div><div class="v num neg">${money(st.expense)}</div>${delta(st.expense,pv.expense,true)}</div>
-      <div><div class="lab">Осталось</div><div class="v num ${left<0?"neg":""}">${money(left)}</div></div>
+      <div><div class="lab">Доходы − расходы</div><div class="v num ${left<0?"neg":""}">${money(left)}</div></div>
     </div>
     ${st.income>0?`<div class="note">Откладывается: <b>${Math.round(left/st.income*100)}%</b> дохода${pv.income>0?` (в прошлом месяце ${Math.round((pv.income-pv.expense)/pv.income*100)}%)`:""}.</div>`:""}
+    ${st.refund?`<div class="note">Возвраты (${esc(money(st.refund))}) не считаются доходом: денег от них не прибавилось, они только вернули потраченное.</div>`:""}
     ${st.debtPaid?`<div class="note">Отправлено на погашение долгов: <span class="num">${money(st.debtPaid)}</span></div>`:""}
-    <div class="note">Стрелки показывают изменение к прошлому месяцу.</div>
+    ${S.month===ym(new Date())?(()=>{
+      // «Доходы − расходы» — итог месяца, а не остаток на счетах: показываем рядом, сколько денег есть и сколько ещё придёт
+      const cash=S.accounts.filter(a=>a.type==="cash"||a.type==="debit").reduce((s,a)=>s+(b[a.id]||0),0);
+      const now=new Date(),dim=new Date(now.getFullYear(),now.getMonth()+1,0).getDate();
+      const due=upcoming(dim-now.getDate()).filter(r=>r.kind==="income"&&!isRefund(r.cat)).reduce((s,r)=>s+r.amount,0);
+      return `<div class="kv" style="border-top:1px solid var(--line);padding-top:10px"><span>Сейчас на картах и наличными</span><b class="num">${money(cash)}</b></div>
+      ${due?`<div class="kv"><span>Ещё придёт до конца месяца</span><b class="num pos">${money(due)}</b></div>`:""}`;
+    })():""}
+    <div class="note">«Доходы − расходы» — сколько за месяц пришло больше, чем ушло. Это не остаток на счетах. Стрелки показывают изменение к прошлому месяцу.</div>
   </section>`;
 
   const now=new Date();
@@ -354,7 +365,7 @@ function txRow(t){
 function txListHtml(){
   const list=filtered();
   if(!list.length)return `<div class="card empty"><b>Ничего не найдено</b>${S.q?"Измените запрос или фильтры.":`В ${esc(monthName(S.month))} операций нет. Добавьте расход, доход или перевод.`}</div>`;
-  const inc=list.filter(t=>t.kind==="income").reduce((s,t)=>s+t.amount,0),exp=list.filter(t=>t.kind==="expense").reduce((s,t)=>s+t.amount,0);
+  const inc=list.filter(t=>t.kind==="income"&&!isRefund(t.cat)).reduce((s,t)=>s+t.amount,0),exp=list.filter(t=>t.kind==="expense").reduce((s,t)=>s+t.amount,0);
   const shown=list.slice(0,300),days={};
   shown.forEach(t=>(days[t.date]??=[]).push(t));
   return `<div class="note" style="margin:4px 0 0">${S.q?"Поиск по всем месяцам. ":""}Операций: ${list.length} · расходы ${esc(money(exp))} · доходы ${esc(money(inc))}</div>`+
@@ -530,6 +541,7 @@ function vMb(){
     ${past&&!S.tx.some(t=>t.date.startsWith(S.month))?`<div class="note">За этот месяц нет операций.</div>`:""}
     ${!past&&Math.abs(save-plan)>0.005?`<div class="note">По плану было ${esc(money(plan))}</div>`:""}
     ${items.length&&!past?`<div class="note" style="margin-top:6px">Потрачено по пунктам ${esc(money(spent))} из ${esc(money(limSum))}, ещё можно потратить ${esc(money(canSpend))}. Если тратить меньше лимитов, накопится больше: при нулевых тратах до конца месяца будет ${esc(money(income-creditSum-spent-freeSum))}.</div>`:""}
+    ${st.refund?`<div class="note" style="margin-top:6px">Возвраты (${esc(money(st.refund))}) не считаются доходом.</div>`:""}
     ${!income&&!past?`<div class="note" style="margin-top:6px">Доходов нет: добавьте регулярный доход (зарплату) на вкладке «Планы» или операцию «Доход».</div>`:""}
   </section>`;
 
@@ -620,6 +632,7 @@ function txSheet(){
     </div>
     ${d.kind==="transfer"?`<div class="fld"><label for="f-date">Дата</label><input id="f-date" type="date" value="${esc(d.date)}"></div>`:""}
     <div class="fld"><label for="f-note">Заметка</label><input id="f-note" type="text" list="notes" value="${esc(d.note)}" placeholder="Необязательно" maxlength="120" autocomplete="off"><datalist id="notes">${notes.map(n=>`<option value="${esc(n)}">`).join("")}</datalist></div>
+    ${d.kind==="income"&&isDebtId(d.acc)?`<p class="note" style="margin:-4px 0 12px">Пополняете кредитку со своей карты? Выберите «Перевод». Если деньги вернули (друг отдал долг, магазин вернул за покупку), выберите категорию «Возврат»: долг уменьшится, но в доходы сумма не попадёт.</p>`:""}
     ${d.kind==="transfer"?`<p class="note" style="margin:-4px 0 12px">Погашение кредита или карты: выберите «Куда» долговой счёт.</p>`:""}
     <div class="actions">
       ${d.id?`<button class="btn danger" data-act="del-tx">${d.confirm?"Точно удалить?":"Удалить"}</button>`:`<button class="btn ghost" data-act="close">Отмена</button>`}
@@ -936,7 +949,7 @@ document.addEventListener("click",e=>{
 document.addEventListener("change",e=>{
   const t=e.target,i=t.id;
   if(i==="a-kind"){syncDraft();accSheet()}
-  else if(i==="f-acc"&&draft?.kind==="transfer"){syncDraft();txSheet()}
+  else if(i==="f-acc"&&draft?.type==="tx"&&draft.kind!=="expense"){syncDraft();txSheet()}
   else if(i==="r-acc"&&draft?.kind==="transfer"){syncDraft();recSheet()}
   else if(i==="f-to"&&draft?.kind==="transfer"){syncDraft();txSheet()}
   else if(i==="r-to"&&draft?.kind==="transfer"){syncDraft();recSheet()}
