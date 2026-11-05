@@ -1,5 +1,5 @@
 // Кэширует оболочку приложения: страница открывается и без сети. Данные берутся из Supabase.
-const CACHE = "budget-v5";
+const CACHE = "budget-v6";
 const SHELL = ["./", "index.html", "app.js", "config.js", "manifest.webmanifest", "icon.svg", "icon-192.png", "icon-512.png"];
 self.addEventListener("install", e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });
 self.addEventListener("activate", e => {

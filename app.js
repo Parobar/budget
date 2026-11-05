@@ -32,7 +32,7 @@ function advance(s,freq,anchor){
   return ds(new Date(y,m,Math.min(anchor||d.getDate(),dim)));
 }
 const nf=new Intl.NumberFormat("ru-RU",{maximumFractionDigits:2});
-const money=v=>nf.format(Math.round(v*100)/100)+" "+S.settings.currency;
+const money=v=>nf.format(Math.round(v*100)/100||0)+" "+S.settings.currency;
 const num=v=>{const x=parseFloat(String(v??"").replace(/\s/g,"").replace(",","."));return Number.isFinite(x)?x:0};
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const $=s=>document.querySelector(s);
@@ -467,19 +467,25 @@ function vPlan(){
 /* ---------- Бюджет: пункты с лимитами, итог месяца, кредиты ---------- */
 const DEBT_CAT=/кредит|ипотек|займ|долг|рассрочк/i;
 // Кредиты месяца: регулярные переводы на долговые счета и регулярные расходы с «кредитной» категорией
+// Каждый кредит считается один раз: если по счёту уже есть регулярная операция, платёж из настроек счёта не добавляется.
+// За прошедшие месяцы берётся только то, что реально оплачено.
 function mbCredits(m){
-  const t0=today(),live=S.recurring.filter(r=>r.active&&!(r.end&&r.end<t0)),pm=r=>r.amount*(PER_MONTH[r.freq]||1);
+  const past=m<ym(new Date()),pm=r=>r.amount*(PER_MONTH[r.freq]||1);
+  const live=past?[]:S.recurring.filter(r=>r.active&&!(r.end&&r.end<m+"-01"));
+  const inMonth=S.tx.filter(t=>t.date.startsWith(m));
+  const debtExp=r=>r.kind==="expense"&&DEBT_CAT.test(r.cat||"");
   const out=[],b=balances();
   S.accounts.filter(isDebt).forEach(a=>{
     let plan=live.filter(r=>r.kind==="transfer"&&r.to===a.id).reduce((s,r)=>s+pm(r),0);
-    const paid=S.tx.filter(t=>t.kind==="transfer"&&t.to===a.id&&t.date.startsWith(m)).reduce((s,t)=>s+t.amount,0);
-    if(!plan&&a.payment&&(b[a.id]||0)<-0.005)plan=a.payment;
+    const paid=inMonth.filter(t=>t.kind==="transfer"&&t.to===a.id).reduce((s,t)=>s+t.amount,0);
+    const covered=S.recurring.some(r=>r.active&&(r.acc===a.id||r.to===a.id));
+    if(!past&&!plan&&!covered&&a.payment&&(b[a.id]||0)<-0.005)plan=a.payment;
     if(plan||paid)out.push({name:a.name,plan,paid});
   });
-  const cats=[...new Set(live.filter(r=>r.kind==="expense"&&DEBT_CAT.test(r.cat||"")).map(r=>r.cat))];
+  const cats=[...new Set([...live.filter(debtExp),...inMonth.filter(debtExp)].map(r=>r.cat))];
   cats.forEach(c=>{
     const plan=live.filter(r=>r.kind==="expense"&&r.cat===c).reduce((s,r)=>s+pm(r),0);
-    const paid=S.tx.filter(t=>t.kind==="expense"&&t.cat===c&&t.date.startsWith(m)).reduce((s,t)=>s+t.amount,0);
+    const paid=inMonth.filter(t=>t.kind==="expense"&&t.cat===c).reduce((s,t)=>s+t.amount,0);
     out.push({name:c,plan,paid,cat:true});
   });
   return out;
@@ -490,12 +496,14 @@ function vMb(){
   const items=[...new Set([...catList("expense"),...Object.keys(lims)])].filter(c=>num(lims[c])>0&&!creditCats.has(c))
     .map(c=>{const lim=num(lims[c]),spent=st.cats[c]||0;return {c,lim,spent,left:lim-spent}});
   const free=Object.entries(st.cats).filter(([c])=>!items.some(x=>x.c===c)&&!creditCats.has(c)).sort((a,b)=>b[1]-a[1]);
-  const plannedInc=monthlyPlan().income,income=Math.max(plannedInc,st.income);
+  const income=S.month<ym(new Date())?st.income:Math.max(monthlyPlan().income,st.income);
   const creditSum=credits.reduce((s,c)=>s+Math.max(c.plan,c.paid),0);
   const limSum=items.reduce((s,x)=>s+x.lim,0),over=items.reduce((s,x)=>s+Math.max(0,-x.left),0);
   const spent=items.reduce((s,x)=>s+x.spent,0),canSpend=items.reduce((s,x)=>s+Math.max(0,x.left),0);
   const freeSum=free.reduce((s,[,v])=>s+v,0);
-  const plan=income-creditSum-limSum,save=plan-over-freeSum;
+  // Прошедший месяц уже не план: вместо лимитов вычитаем то, что реально потратили
+  const past=S.month<ym(new Date());
+  const plan=income-creditSum-limSum,save=past?income-creditSum-spent-freeSum:plan-over-freeSum;
 
   let h=`<h2>Пункты бюджета</h2>`;
   if(!items.length)h+=`<div class="card empty"><b>Лимитов пока нет</b>Задайте лимиты на месяц по категориям, и здесь появятся пункты бюджета.<div style="margin-top:14px"><button class="btn" data-tab="more">Задать лимиты</button></div></div>`;
@@ -515,13 +523,15 @@ function vMb(){
   h+=`<h2>Итог за ${esc(monthName(S.month))}</h2><section class="card">
     <div class="kv"><span>Доходы</span><b class="num pos">${money(income)}</b></div>
     ${creditSum?`<div class="kv"><span>Кредиты</span><b class="num neg">${money(-creditSum)}</b></div>`:""}
-    <div class="kv"><span>Лимиты по пунктам</span><b class="num neg">${money(-limSum)}</b></div>
-    ${over?`<div class="kv"><span>Перерасход по пунктам</span><b class="num neg">${money(-over)}</b></div>`:""}
+    ${past?`<div class="kv"><span>Потрачено по пунктам</span><b class="num neg">${money(-spent)}</b></div>`
+      :`<div class="kv"><span>Лимиты по пунктам</span><b class="num neg">${money(-limSum)}</b></div>
+    ${over?`<div class="kv"><span>Перерасход по пунктам</span><b class="num neg">${money(-over)}</b></div>`:""}`}
     ${freeSum?`<div class="kv"><span>Траты без лимита</span><b class="num neg">${money(-freeSum)}</b></div>`:""}
-    <div class="kv tot"><b>Должно накопиться</b><b class="big num ${save<0?"neg":"pos"}">${money(save)}</b></div>
-    ${save!==plan?`<div class="note">По плану было ${esc(money(plan))}</div>`:""}
-    ${items.length?`<div class="note" style="margin-top:6px">Потрачено по пунктам ${esc(money(spent))} из ${esc(money(limSum))}, ещё можно потратить ${esc(money(canSpend))}. Если тратить меньше лимитов, накопится больше: при нулевых тратах до конца месяца будет ${esc(money(income-creditSum-spent-freeSum))}.</div>`:""}
-    ${!income?`<div class="note" style="margin-top:6px">Доходов нет: добавьте регулярный доход (зарплату) на вкладке «Планы» или операцию «Доход».</div>`:""}
+    <div class="kv tot"><b>${past?"Накопилось":"Должно накопиться"}</b><b class="big num ${save<0?"neg":"pos"}">${money(save)}</b></div>
+    ${past&&!S.tx.some(t=>t.date.startsWith(S.month))?`<div class="note">За этот месяц нет операций.</div>`:""}
+    ${!past&&Math.abs(save-plan)>0.005?`<div class="note">По плану было ${esc(money(plan))}</div>`:""}
+    ${items.length&&!past?`<div class="note" style="margin-top:6px">Потрачено по пунктам ${esc(money(spent))} из ${esc(money(limSum))}, ещё можно потратить ${esc(money(canSpend))}. Если тратить меньше лимитов, накопится больше: при нулевых тратах до конца месяца будет ${esc(money(income-creditSum-spent-freeSum))}.</div>`:""}
+    ${!income&&!past?`<div class="note" style="margin-top:6px">Доходов нет: добавьте регулярный доход (зарплату) на вкладке «Планы» или операцию «Доход».</div>`:""}
   </section>`;
 
   if(credits.length)h+=`<h2>Кредиты в этом месяце</h2><div class="card">`+credits.map(c=>
