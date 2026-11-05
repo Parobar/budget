@@ -466,29 +466,28 @@ function vPlan(){
 
 /* ---------- Бюджет: пункты с лимитами, итог месяца, кредиты ---------- */
 const DEBT_CAT=/кредит|ипотек|займ|долг|рассрочк/i;
-// Кредиты месяца: регулярные переводы на долговые счета и регулярные расходы с «кредитной» категорией
+// Кредиты месяца: переводы на долговые счета и расходы с «кредитной» категорией.
+// Платежи с группой («Кредиты Кирилл») складываются в группу, остальные показываются по счёту.
 // Каждый кредит считается один раз: если по счёту уже есть регулярная операция, платёж из настроек счёта не добавляется.
 // За прошедшие месяцы берётся только то, что реально оплачено.
+const debtGroup=c=>c&&DEBT_CAT.test(c)?c:"";
 function mbCredits(m){
   const past=m<ym(new Date()),pm=r=>r.amount*(PER_MONTH[r.freq]||1);
   const live=past?[]:S.recurring.filter(r=>r.active&&!(r.end&&r.end<m+"-01"));
   const inMonth=S.tx.filter(t=>t.date.startsWith(m));
-  const debtExp=r=>r.kind==="expense"&&DEBT_CAT.test(r.cat||"");
-  const out=[],b=balances();
+  const debtIds=new Set(S.accounts.filter(isDebt).map(a=>a.id));
+  const map=new Map(),b=balances();
+  const add=(name,cat,plan,paid)=>{const x=map.get(name)||{name,plan:0,paid:0,cat};x.plan+=plan;x.paid+=paid;map.set(name,x)};
+  // ключ платежа: группа, если указана, иначе название счёта-кредита
+  const key=r=>r.kind==="expense"?(debtGroup(r.cat)?[r.cat,true]:null)
+    :(r.kind==="transfer"&&debtIds.has(r.to))?(debtGroup(r.cat)?[r.cat,true]:[accName(r.to),false]):null;
+  live.forEach(r=>{const k=key(r);if(k)add(k[0],k[1],pm(r),0)});
+  inMonth.forEach(t=>{const k=key(t);if(k)add(k[0],k[1],0,t.amount)});
   S.accounts.filter(isDebt).forEach(a=>{
-    let plan=live.filter(r=>r.kind==="transfer"&&r.to===a.id).reduce((s,r)=>s+pm(r),0);
-    const paid=inMonth.filter(t=>t.kind==="transfer"&&t.to===a.id).reduce((s,t)=>s+t.amount,0);
     const covered=S.recurring.some(r=>r.active&&(r.acc===a.id||r.to===a.id));
-    if(!past&&!plan&&!covered&&a.payment&&(b[a.id]||0)<-0.005)plan=a.payment;
-    if(plan||paid)out.push({name:a.name,plan,paid});
+    if(!past&&!covered&&a.payment&&(b[a.id]||0)<-0.005)add(a.name,false,a.payment,0);
   });
-  const cats=[...new Set([...live.filter(debtExp),...inMonth.filter(debtExp)].map(r=>r.cat))];
-  cats.forEach(c=>{
-    const plan=live.filter(r=>r.kind==="expense"&&r.cat===c).reduce((s,r)=>s+pm(r),0);
-    const paid=inMonth.filter(t=>t.kind==="expense"&&t.cat===c).reduce((s,t)=>s+t.amount,0);
-    out.push({name:c,plan,paid,cat:true});
-  });
-  return out;
+  return [...map.values()];
 }
 function vMb(){
   const st=monthStats(S.month),lims=S.settings.limits||{},ro=S.readOnly;
@@ -572,6 +571,13 @@ function vMore(){
 /* ============ Формы ============ */
 const SPEC={tx:["f",["amount","date","cat","acc","to","note"]],acc:["a",["name","kind","amount","limit","rate","payment","actual"]],
   rec:["r",["amount","cat","acc","to","note","freq","next","end","active"]],goal:["g",["name","target","acc","saved","deadline"]]};
+const isDebtId=id=>S.accounts.some(a=>a.id===id&&isDebt(a));
+// Для перевода на кредит: в какую группу кредитов он попадает на вкладке «Бюджет»
+function groupFld(p,d){
+  const gs=catList("expense").filter(c=>DEBT_CAT.test(c));
+  if(!gs.length||!isDebtId(d.to))return "";
+  return `<div class="fld"><label for="${p}-cat">Группа кредитов</label><select id="${p}-cat"><option value="">Без группы</option>${gs.map(c=>`<option ${c===d.cat?"selected":""}>${esc(c)}</option>`).join("")}</select></div>`;
+}
 function syncDraft(){
   if(!draft||!SPEC[draft.type])return;
   const [p,keys]=SPEC[draft.type];
@@ -606,7 +612,7 @@ function txSheet(){
   sheet(`${seg([["expense","Расход"],["income","Доход"],["transfer","Перевод"]],d.kind,"kind")}
     ${rc.length?`<div class="chips" aria-label="Недавние">${rc.map(t=>`<button class="chip" data-act="recent" data-id="${esc(t.id)}">${esc(t.note||t.cat||"Перевод")} · ${nf.format(t.amount)}</button>`).join("")}</div>`:""}
     <div class="fld"><label for="f-amount">Сумма, ${esc(S.settings.currency)}</label><input class="amount" id="f-amount" type="number" inputmode="decimal" min="0" step="any" value="${esc(d.amount)}" placeholder="0" autofocus></div>
-    ${d.kind==="transfer"?"":`<div class="fld"><label for="f-cat">Категория</label><select id="f-cat">${cl.map(c=>`<option ${c===d.cat?"selected":""}>${esc(c)}</option>`).join("")}</select></div>`}
+    ${d.kind==="transfer"?groupFld("f",d):`<div class="fld"><label for="f-cat">Категория</label><select id="f-cat">${cl.map(c=>`<option ${c===d.cat?"selected":""}>${esc(c)}</option>`).join("")}</select></div>`}
     <div class="two">
       <div class="fld"><label for="f-acc">${d.kind==="transfer"?"Откуда":"Счёт"}</label><select id="f-acc">${opts(d.acc,accs)}</select></div>
       ${d.kind==="transfer"?`<div class="fld"><label for="f-to">Куда</label><select id="f-to">${opts(d.to,accs.filter(a=>a.id!==d.acc))}</select></div>`
@@ -627,7 +633,7 @@ async function saveTx(){
   if(!d.date)return toast("Укажите дату");
   if(d.kind==="transfer"&&(!d.to||d.to===d.acc))return toast("Выберите два разных счёта");
   const rec={kind:d.kind,amount:Math.round(amount*100)/100,date:d.date,acc:d.acc,note:d.note.trim(),by:d.by||S.uid||""};
-  if(d.kind==="transfer")rec.to=d.to;else rec.cat=d.cat;
+  if(d.kind==="transfer"){rec.to=d.to;rec.cat=isDebtId(d.to)?debtGroup(d.cat):""}else rec.cat=d.cat;
   try{
     await api.saveTx(d.id,rec);lastAcc=d.acc;
     if(!rec.date.startsWith(S.month))S.month=rec.date.slice(0,7);
@@ -697,7 +703,7 @@ function recSheet(){
   const cl=d.kind==="transfer"?[]:[...new Set([...catList(d.kind),d.cat].filter(Boolean))];
   sheet(`${seg([["expense","Расход"],["income","Доход"],["transfer","Перевод"]],d.kind,"rkind")}
     ${fldNum("r-amount",`Сумма, ${esc(S.settings.currency)}`,d.amount,"0")}
-    ${d.kind==="transfer"?"":`<div class="fld"><label for="r-cat">Категория</label><select id="r-cat">${cl.map(c=>`<option ${c===d.cat?"selected":""}>${esc(c)}</option>`).join("")}</select></div>`}
+    ${d.kind==="transfer"?groupFld("r",d):`<div class="fld"><label for="r-cat">Категория</label><select id="r-cat">${cl.map(c=>`<option ${c===d.cat?"selected":""}>${esc(c)}</option>`).join("")}</select></div>`}
     <div class="two"><div class="fld"><label for="r-acc">${d.kind==="transfer"?"Откуда":"Счёт"}</label><select id="r-acc">${opts(d.acc,accs)}</select></div>
     ${d.kind==="transfer"?`<div class="fld"><label for="r-to">Куда</label><select id="r-to">${opts(d.to,accs.filter(a=>a.id!==d.acc))}</select></div>`:`<div class="fld"><label for="r-freq">Повтор</label><select id="r-freq">${Object.entries(FREQ).map(([k,l])=>`<option value="${k}" ${k===d.freq?"selected":""}>${l}</option>`).join("")}</select></div>`}</div>
     ${d.kind==="transfer"?`<div class="fld"><label for="r-freq">Повтор</label><select id="r-freq">${Object.entries(FREQ).map(([k,l])=>`<option value="${k}" ${k===d.freq?"selected":""}>${l}</option>`).join("")}</select></div>`:""}
@@ -717,7 +723,7 @@ async function saveRec(){
   if(!d.next)return toast("Укажите ближайшую дату");
   if(d.kind==="transfer"&&(!d.to||d.to===d.acc))return toast("Выберите два разных счёта");
   const rec={kind:d.kind,amount:Math.round(amount*100)/100,acc:d.acc,note:d.note.trim(),freq:d.freq,next:d.next,end:d.end||"",active:d.id?d.active:true,by:d.by||S.uid||""};
-  if(d.kind==="transfer")rec.to=d.to;else rec.cat=d.cat;
+  if(d.kind==="transfer"){rec.to=d.to;rec.cat=isDebtId(d.to)?debtGroup(d.cat):""}else rec.cat=d.cat;
   try{await api.saveRec(d.id,rec);closeSheet();toast("Сохранено")}catch(e){toast("Не удалось сохранить: "+(e.message||e.code))}
 }
 async function delRec(){
@@ -932,6 +938,8 @@ document.addEventListener("change",e=>{
   if(i==="a-kind"){syncDraft();accSheet()}
   else if(i==="f-acc"&&draft?.kind==="transfer"){syncDraft();txSheet()}
   else if(i==="r-acc"&&draft?.kind==="transfer"){syncDraft();recSheet()}
+  else if(i==="f-to"&&draft?.kind==="transfer"){syncDraft();txSheet()}
+  else if(i==="r-to"&&draft?.kind==="transfer"){syncDraft();recSheet()}
   else if(i==="g-acc"){syncDraft();goalSheet()}
   else if(i==="f-cat"&&draft)draft.touched=true;
   else if(i==="f-note"&&draft&&draft.type==="tx"&&!draft.touched&&draft.kind!=="transfer"){
