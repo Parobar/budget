@@ -266,6 +266,43 @@ function nwChart(){
     ${mn!==mx?`<text x="${W-R}" y="10" text-anchor="end">мин. ${esc(money(mn))}</text>`:""}
   </svg>`;
 }
+const monthEnd=m=>{const [y,mo]=m.split("-").map(Number);return ds(new Date(y,mo,0))};
+// Сумма регулярной операции по датам, попадающим в [from, to]: учитывает дату следующего платежа и дату окончания
+function occIn(r,from,to){
+  let d=r.next,c=0,sum=0;
+  while(d<=to&&c<60){if(r.end&&d>r.end)break;if(d>=from)sum+=r.amount;d=advance(d,r.freq,r.anchor);c++}
+  return sum;
+}
+const moneyIds=()=>new Set(S.accounts.filter(a=>a.type==="cash"||a.type==="debit").map(a=>a.id));
+const isDebtPay=(r,M)=>M.has(r.acc)&&((r.kind==="transfer"&&isDebtId(r.to))||(r.kind==="expense"&&DEBT_CAT.test(r.cat||"")));
+// Деньги до конца текущего месяца: что есть на картах, что придёт, что обязательно уйдёт на кредиты.
+// Платежи по кредитам в начале следующего месяца, до первого дохода, тоже надо оставить из денег этого месяца.
+function cashPlan(){
+  const M=moneyIds(),b=balances(),t0=today(),m=ym(new Date()),end=monthEnd(m),nextEnd=monthEnd(shiftMonth(m,1));
+  const live=S.recurring.filter(r=>r.active);
+  const cash=S.accounts.filter(a=>M.has(a.id)).reduce((s,a)=>s+(b[a.id]||0),0);
+  const incRec=live.filter(r=>r.kind==="income"&&M.has(r.acc)&&!isRefund(r.cat));
+  const income=incRec.reduce((s,r)=>s+occIn(r,t0,end),0);
+  const debt=live.filter(r=>isDebtPay(r,M)).reduce((s,r)=>s+occIn(r,t0,end),0);
+  // первая дата дохода в следующем месяце
+  let firstInc=null;
+  incRec.forEach(r=>{
+    let d=r.next,c=0;while(d<=end&&c<60){d=advance(d,r.freq,r.anchor);c++}
+    if(d<=nextEnd&&!(r.end&&d>r.end)&&(!firstInc||d<firstInc))firstInc=d;
+  });
+  const early=[];
+  live.filter(r=>isDebtPay(r,M)).forEach(r=>{
+    let d=r.next,c=0;
+    while(d<=nextEnd&&c<60){
+      if(r.end&&d>r.end)break;
+      if(d>end&&(!firstInc||d<firstInc))early.push({name:r.kind==="transfer"?accName(r.to):r.cat,date:d,amount:r.amount});
+      d=advance(d,r.freq,r.anchor);c++;
+    }
+  });
+  const earlySum=early.reduce((s,x)=>s+x.amount,0);
+  const days=pd(end).getDate()-new Date().getDate()+1;
+  return {cash,income,debt,early,earlySum,firstInc,free:cash+income-debt-earlySum,days};
+}
 function cashFlow(m){
   const M=new Set(S.accounts.filter(a=>a.type==="cash"||a.type==="debit").map(a=>a.id));
   const r={start:S.accounts.filter(a=>M.has(a.id)).reduce((s,a)=>s+(a.initial||0),0),in:0,spent:0,debt:0,other:0};
@@ -281,6 +318,13 @@ function cashFlow(m){
     else if(fromM&&isDebtId(t.to))r.debt+=t.amount;else r.other-=d;
   });
   r.end=r.start+r.in-r.spent-r.debt-r.other;
+  // Покупки кредиткой — тоже траты месяца. Погашение кредитки сначала покрывает их, остальное — старый долг.
+  // Так «Потрачено» — все траты, «На кредиты» — без двойного счёта, а итог сходится с остатком на картах.
+  const cc=new Set(S.accounts.filter(a=>a.type==="credit").map(a=>a.id)),inM=S.tx.filter(t=>t.date.startsWith(m));
+  r.cardBuys=inM.filter(t=>t.kind==="expense"&&cc.has(t.acc)).reduce((s,t)=>s+t.amount,0);
+  const payCards=r.payCards=inM.filter(t=>t.kind==="transfer"&&M.has(t.acc)&&cc.has(t.to)).reduce((s,t)=>s+t.amount,0);
+  r.covered=Math.min(r.cardBuys,payCards);
+  r.spentAll=r.spent+r.cardBuys;r.debtNet=r.debt-r.covered;r.borrowed=r.cardBuys-r.covered;r.loans=r.debt-payCards;
   return r;
 }
 function vHome(){
@@ -294,31 +338,33 @@ function vHome(){
       <div><div class="lab">Долги</div><div class="v num neg">${money(Math.abs(w.debts))}</div></div>
     </div></section>`;
   const bud=vBudget(false);
-  if(bud)h+=`<h2>План на месяц</h2>`+bud.replace("</section>",`<button class="link" data-tab="plan" style="justify-self:start">Подробнее</button></section>`);
+  if(bud)h+=`<h2>Обычный месяц по плану</h2>`+bud.replace("</section>",`<button class="link" data-tab="plan" style="justify-self:start">Подробнее</button></section>`);
   // Деньги на картах и наличными за месяц: было на 1-е, пришло, потрачено, ушло на кредиты, стало — сходится с остатком карты
   const cf=cashFlow(S.month),cur=S.month===ym(new Date());
-  const onCredit=S.tx.filter(t=>t.kind==="expense"&&t.date.startsWith(S.month)&&isDebtId(t.acc)).reduce((s,t)=>s+t.amount,0);
   const first=pd(S.month+"-01").toLocaleDateString("ru-RU",{day:"numeric",month:"long"});
-  const due=cur?(()=>{const n=new Date(),dim=new Date(n.getFullYear(),n.getMonth()+1,0).getDate();
-    return upcoming(dim-n.getDate()).filter(r=>r.kind==="income"&&!isRefund(r.cat)).reduce((s,r)=>s+r.amount,0)})():0;
+  const cp=cur?cashPlan():null;
   h+=`<h2>${esc(monthName(S.month))}</h2><section class="card hero">
     <div class="trio">
       <div><div class="lab">Доходы</div><div class="v num pos">${money(st.income)}</div>${delta(st.income,pv.income,false)}</div>
       <div><div class="lab">Расходы</div><div class="v num neg">${money(st.expense)}</div>${delta(st.expense,pv.expense,true)}</div>
-      <div><div class="lab">На кредиты</div><div class="v num">${money(st.debtPaid)}</div></div>
+      <div><div class="lab">На кредиты</div><div class="v num">${money(cf.debtNet)}</div></div>
     </div>
-    ${onCredit?`<div class="note">Из расходов ${esc(money(onCredit))} оплачено кредиткой: с карт эти деньги уходят платежом по кредитке.</div>`:""}
+    ${cf.cardBuys?`<div class="note">Из расходов ${esc(money(cf.cardBuys))} оплачено кредиткой.${cf.covered?` Погашение кредитки покрывает эти покупки, поэтому в «На кредиты» идёт только остальное.`:""}</div>`:""}
     ${st.refund?`<div class="note">Возвраты (${esc(money(st.refund))}) не считаются доходом: денег от них не прибавилось, они только вернули потраченное.</div>`:""}
   </section>
   <h2>Деньги на картах и наличными</h2><section class="card">
     <div class="kv"><span>На ${esc(first)}</span><b class="num">${money(cf.start)}</b></div>
     <div class="kv"><span>Пришло</span><b class="num pos">+${money(cf.in)}</b></div>
-    <div class="kv"><span>Потрачено с карт и наличными</span><b class="num neg">${money(-cf.spent)}</b></div>
-    ${cf.debt?`<div class="kv"><span>Ушло на кредиты</span><b class="num neg">${money(-cf.debt)}</b></div>`:""}
+    <div class="kv"><span>Потрачено${cf.cardBuys?`<div class="note">с карт ${esc(money(cf.spent))}, кредиткой ${esc(money(cf.cardBuys))}</div>`:""}</span><b class="num neg">${money(-cf.spentAll)}</b></div>
+    ${cf.debtNet>0.005?`<div class="kv"><span>Ушло на кредиты${cf.covered?`<div class="note">погашение кредитной карты ${esc(money(cf.payCards))} − покупки кредиткой в этом месяце ${esc(money(cf.covered))} (они уже в «Потрачено») = ${esc(money(cf.payCards-cf.covered))}${cf.loans>0.005?`; платежи по кредитам ${esc(money(cf.loans))}`:""}</div>`:""}</span><b class="num neg">${money(-cf.debtNet)}</b></div>`:""}
+    ${cf.borrowed>0.005?`<div class="kv"><span>Куплено кредиткой, ещё не погашено</span><b class="num pos">+${money(cf.borrowed)}</b></div>`:""}
     ${Math.abs(cf.other)>0.005?`<div class="kv"><span>Переводы на другие счета</span><b class="num ${cf.other>0?"neg":"pos"}">${cf.other>0?"":"+"}${money(-cf.other)}</b></div>`:""}
     <div class="kv tot"><b>${cur?"Сейчас":"На конец месяца"}</b><b class="num" style="font-size:18px">${money(cf.end)}</b></div>
-    ${due?`<div class="kv"><span>Ещё придёт до конца месяца</span><b class="num pos">${money(due)}</b></div>`:""}
-    <div class="note">Стрелки у доходов и расходов показывают изменение к прошлому месяцу.</div>
+    ${cp?`<div class="kv" style="margin-top:8px"><span>Придёт до конца месяца</span><b class="num pos">+${money(cp.income)}</b></div>
+    ${cp.debt?`<div class="kv"><span>Уйдёт на кредиты до конца месяца</span><b class="num neg">${money(-cp.debt)}</b></div>`:""}
+    ${cp.early.map(x=>`<div class="kv"><span>${esc(shortDate(x.date))}: ${esc(x.name)}<div class="note">платёж раньше следующего дохода${cp.firstInc?` (${esc(shortDate(cp.firstInc))})`:""}, деньги нужно оставить</div></span><b class="num neg">${money(-x.amount)}</b></div>`).join("")}
+    <div class="kv tot"><b>Свободно на жизнь до конца месяца</b><b class="num ${cp.free<0?"neg":"pos"}" style="font-size:18px">${money(cp.free)}</b></div>
+    <div class="note">${cp.free>0?`Это примерно ${esc(money(cp.free/cp.days))} в день на ${cp.days} дн., включая сегодня.`:`<span class="neg">Денег до конца месяца не хватает на обязательные платежи.</span>`}</div>`:""}
   </section>`;
 
   const now=new Date();
@@ -332,15 +378,17 @@ function vHome(){
     const free=Object.entries(st.cats).filter(([c])=>!limCats.includes(c)&&!DEBT_CAT.test(c)).reduce((s,[,v])=>s+v,0);
     const forecast=limCats.reduce((s,c)=>s+Math.max(num(lims[c]),st.cats[c]||0),0)+free;
     const daysLeft=dim-day+1;
-    const credit=upcoming(dim-day).filter(r=>(r.kind==="transfer"&&isDebtId(r.to))||(r.kind==="expense"&&DEBT_CAT.test(r.cat||""))).reduce((s,r)=>s+r.amount,0);
+    // тратить в день можно не больше, чем позволяют и лимиты, и реальные деньги
+    const canSpend=Math.max(0,Math.min(left,cp.free));
     h+=`<h2>Прогноз</h2><section class="card">
       <div class="kv"><span>Потрачено с 1-го числа</span><b class="num">${money(st.expense)}</b></div>
       ${limCats.length?`<div class="kv"><span>Осталось по лимитам</span><b class="num">${money(left)}</b></div>
-      <div class="kv"><span>Можно тратить в день (ещё ${daysLeft} дн.)</span><b class="num">${money(left/daysLeft)}</b></div>
+      ${cp.free<left?`<div class="kv"><span>Денег на это есть</span><b class="num ${cp.free<0?"neg":""}">${money(cp.free)}</b></div>
+      <div class="note neg">Не хватает ${esc(money(left-Math.max(0,cp.free)))}: лимиты рассчитаны на обычный месяц, а деньги этого месяца ушли на кредиты.</div>`:""}
+      <div class="kv"><span>Можно тратить в день (ещё ${daysLeft} дн.)</span><b class="num">${money(canSpend/daysLeft)}</b></div>
       <div class="kv"><span>Расходы к концу месяца, если уложиться в лимиты</span><b class="num">${money(forecast)}</b></div>
       ${over.length?`<div class="note neg">Сверх лимита: ${esc(over.join(", "))} ₽</div>`:""}`
       :`<div class="note">Задайте лимиты на вкладке «Ещё», и здесь появится «сколько можно тратить в день».</div>`}
-      ${credit?`<div class="kv"><span>Ещё платежи по кредитам до конца месяца</span><b class="num">${money(credit)}</b></div>`:""}
     </section>`;
   }
 
@@ -513,7 +561,8 @@ const DEBT_CAT=/кредит|ипотек|займ|долг|рассрочк/i;
 // За прошедшие месяцы берётся только то, что реально оплачено.
 const debtGroup=c=>c&&DEBT_CAT.test(c)?c:"";
 function mbCredits(m){
-  const past=m<ym(new Date()),pm=r=>r.amount*(PER_MONTH[r.freq]||1);
+  // текущий месяц: оплачено + то, что ещё спишется до конца месяца по датам; будущий: платежи с датами в этом месяце
+  const past=m<ym(new Date()),from=m===ym(new Date())?today():m+"-01",to=monthEnd(m),pm=r=>occIn(r,from,to);
   const live=past?[]:S.recurring.filter(r=>r.active&&!(r.end&&r.end<m+"-01"));
   const inMonth=S.tx.filter(t=>t.date.startsWith(m));
   const debtIds=new Set(S.accounts.filter(isDebt).map(a=>a.id));
@@ -534,13 +583,20 @@ function mbCredits(m){
   };
   live.forEach(r=>{const k=key(r);if(k)add(k[0],k[1],k[2],pm(r),0)});
   inMonth.forEach(t=>{const k=key(t);if(k)add(k[0],k[1],k[2],0,t.amount)});
+  // Покупки кредиткой в этом месяце уже есть в расходах. Платёж по кредитке их покрывает,
+  // поэтому в «Кредиты» идёт только то, что сверх них (старый долг), иначе покупки считаются дважды.
+  S.accounts.filter(a=>a.type==="credit").forEach(a=>{
+    let buys=inMonth.filter(t=>t.kind==="expense"&&t.acc===a.id).reduce((s,t)=>s+t.amount,0);
+    map.forEach(x=>{const y=x.by[a.id];if(y&&buys>0){const cut=Math.min(y.paid,buys);y.paid-=cut;buys-=cut}});
+  });
   S.accounts.filter(isDebt).forEach(a=>{
     const covered=S.recurring.some(r=>r.active&&(r.acc===a.id||r.to===a.id));
-    if(!past&&!covered&&a.payment&&(b[a.id]||0)<-0.005)add(a.name,false,a.id,a.payment,0);
+    const paidNow=inMonth.some(t=>t.kind==="transfer"&&t.to===a.id);
+    if(!past&&!covered&&!paidNow&&a.payment&&(b[a.id]||0)<-0.005)add(a.name,false,a.id,a.payment,0);
   });
   return [...map.values()].map(x=>{
     const v=Object.values(x.by);
-    return {name:x.name,cat:x.cat,plan:v.reduce((s,y)=>s+y.plan,0),paid:v.reduce((s,y)=>s+y.paid,0),due:v.reduce((s,y)=>s+Math.max(y.plan,y.paid),0)};
+    return {name:x.name,cat:x.cat,plan:v.reduce((s,y)=>s+y.plan,0),paid:v.reduce((s,y)=>s+y.paid,0),due:v.reduce((s,y)=>s+y.plan+y.paid,0)};
   });
 }
 function vMb(){
@@ -549,7 +605,10 @@ function vMb(){
   const items=[...new Set([...catList("expense"),...Object.keys(lims)])].filter(c=>num(lims[c])>0&&!creditCats.has(c))
     .map(c=>{const lim=num(lims[c]),spent=st.cats[c]||0;return {c,lim,spent,left:lim-spent}});
   const free=Object.entries(st.cats).filter(([c])=>!items.some(x=>x.c===c)&&!creditCats.has(c)).sort((a,b)=>b[1]-a[1]);
-  const income=S.month<ym(new Date())?st.income:Math.max(monthlyPlan().income,st.income);
+  // доход месяца: уже пришло + регулярные доходы, которые ещё придут в этом месяце по датам
+  const mFrom=S.month===ym(new Date())?today():S.month+"-01";
+  const incDue=S.month<ym(new Date())?0:S.recurring.filter(r=>r.active&&r.kind==="income"&&!isRefund(r.cat)).reduce((s,r)=>s+occIn(r,mFrom,monthEnd(S.month)),0);
+  const income=st.income+incDue;
   const creditSum=credits.reduce((s,c)=>s+c.due,0);
   const limSum=items.reduce((s,x)=>s+x.lim,0),over=items.reduce((s,x)=>s+Math.max(0,-x.left),0);
   const spent=items.reduce((s,x)=>s+x.spent,0),canSpend=items.reduce((s,x)=>s+Math.max(0,x.left),0);
@@ -574,22 +633,28 @@ function vMb(){
     (ro?"":`<button class="btn ghost block" data-act="spend" data-cat="" style="margin-top:6px">+ Другая трата</button>`)+`</div>`;
 
   h+=`<h2>Итог за ${esc(monthName(S.month))}</h2><section class="card">
-    <div class="kv"><span>Доходы</span><b class="num pos">${money(income)}</b></div>
+    <div class="kv"><span>Доходы${incDue&&st.income?`<div class="note">пришло ${esc(money(st.income))}, ещё придёт ${esc(money(incDue))}</div>`:""}</span><b class="num pos">${money(income)}</b></div>
     ${creditSum?`<div class="kv"><span>Кредиты</span><b class="num neg">${money(-creditSum)}</b></div>`:""}
     ${past?`<div class="kv"><span>Потрачено по пунктам</span><b class="num neg">${money(-spent)}</b></div>`
       :`<div class="kv"><span>Лимиты по пунктам</span><b class="num neg">${money(-limSum)}</b></div>
     ${over?`<div class="kv"><span>Перерасход по пунктам</span><b class="num neg">${money(-over)}</b></div>`:""}`}
     ${freeSum?`<div class="kv"><span>Траты без лимита</span><b class="num neg">${money(-freeSum)}</b></div>`:""}
     <div class="kv tot"><b>${past?"Накопилось":"Должно накопиться"}</b><b class="big num ${save<0?"neg":"pos"}">${money(save)}</b></div>
+    ${!past?(()=>{const cf=cashFlow(S.month),endCash=cf.start+save;
+      return `<div class="note">Связь с картами: на ${esc(pd(S.month+"-01").toLocaleDateString("ru-RU",{day:"numeric",month:"long"}))} было ${esc(money(cf.start))}, значит в конце месяца на картах будет <b class="num ${endCash<0?"neg":""}">${esc(money(endCash))}</b>${endCash<0?" — столько денег нет, траты по лимитам придётся сократить":""}.</div>`})():""}
     ${past&&!S.tx.some(t=>t.date.startsWith(S.month))?`<div class="note">За этот месяц нет операций.</div>`:""}
     ${!past&&Math.abs(save-plan)>0.005?`<div class="note">По плану было ${esc(money(plan))}</div>`:""}
     ${items.length&&!past?`<div class="note" style="margin-top:6px">Потрачено по пунктам ${esc(money(spent))} из ${esc(money(limSum))}, ещё можно потратить ${esc(money(canSpend))}. Если тратить меньше лимитов, накопится больше: при нулевых тратах до конца месяца будет ${esc(money(income-creditSum-spent-freeSum))}.</div>`:""}
     ${st.refund?`<div class="note" style="margin-top:6px">Возвраты (${esc(money(st.refund))}) не считаются доходом.</div>`:""}
+    ${S.month===ym(new Date())?(()=>{const cp=cashPlan();return `<div class="kv" style="border-top:1px solid var(--line);margin-top:8px;padding-top:10px"><span>Реально свободно на жизнь до конца месяца<div class="note">деньги на картах + что придёт − кредиты</div></span><b class="num ${cp.free<0?"neg":"pos"}">${money(cp.free)}</b></div>`})():""}
     ${!income&&!past?`<div class="note" style="margin-top:6px">Доходов нет: добавьте регулярный доход (зарплату) на вкладке «Планы» или операцию «Доход».</div>`:""}
   </section>`;
 
   if(credits.length)h+=`<h2>Кредиты в этом месяце</h2><div class="card">`+credits.map(c=>
     `<div class="kv"><span>${esc(c.name)}<div class="note">оплачено ${esc(money(c.paid))}</div></span><b class="num">${money(c.due)}</b></div>`).join("")+
+    (()=>{const cc=new Set(S.accounts.filter(a=>a.type==="credit").map(a=>a.id)),inM=S.tx.filter(t=>t.date.startsWith(S.month));
+      const buys=inM.filter(t=>t.kind==="expense"&&cc.has(t.acc)).reduce((s,t)=>s+t.amount,0),pay=inM.filter(t=>t.kind==="transfer"&&cc.has(t.to)).reduce((s,t)=>s+t.amount,0);
+      return buys&&pay?`<div class="note" style="margin-top:6px">Погашение кредиток ${esc(money(pay))} учтено без покупок кредиткой в этом месяце (${esc(money(Math.min(buys,pay)))}): они уже есть в расходах.</div>`:""})()+
     `<div class="note" style="margin-top:6px">Платежи списываются сами по регулярным операциям.</div></div>`;
   return h;
 }
