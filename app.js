@@ -212,7 +212,7 @@ const delta=(cur,prev,badUp)=>{
 function render(){
   const inApp=S.stage==="app";
   document.querySelector("nav.tabs").hidden=!inApp;
-  $("#monthnav").style.visibility=(inApp&&["home","budget","tx"].includes(S.tab))?"visible":"hidden";
+  $("#monthnav").style.visibility=(inApp&&["home","budget","charts","tx"].includes(S.tab))?"visible":"hidden";
   $("#fab").hidden=!inApp||S.readOnly||!["home","tx","acc"].includes(S.tab);
   $("#monthlabel").textContent=monthName(S.month);
   document.querySelectorAll("#tabs button").forEach(b=>b.setAttribute("aria-current",b.dataset.tab===S.tab));
@@ -222,7 +222,7 @@ function render(){
   if(S.stage==="house"){app.innerHTML=vHouse();return}
   if(S.err){app.innerHTML=`<div class="card empty"><b>Не удалось загрузить данные</b>${esc(S.err)}<div style="margin-top:14px"><button class="btn" data-act="reload">Повторить</button></div></div>`;return}
   if(!S.loaded){app.innerHTML=`<div class="card empty">Загружаю…</div>`;return}
-  app.innerHTML=({home:vHome,budget:vMb,tx:vTx,acc:vAcc,plan:vPlan,more:vMore}[S.tab])();
+  app.innerHTML=({home:vHome,budget:vMb,charts:vCharts,tx:vTx,acc:vAcc,plan:vPlan,more:vMore}[S.tab])();
 }
 
 function vAuth(){
@@ -301,7 +301,17 @@ function cashPlan(){
   });
   const earlySum=early.reduce((s,x)=>s+x.amount,0);
   const days=pd(end).getDate()-new Date().getDate()+1;
-  return {cash,income,debt,early,earlySum,firstInc,free:cash+income-debt-earlySum,days};
+  // кредитки без графика платежей: текущий долг нужно погасить полностью
+  const cards=S.accounts.filter(a=>a.type==="credit"&&!live.some(r=>r.kind==="transfer"&&r.to===a.id)&&(b[a.id]||0)<-0.005).map(a=>({name:a.name,amount:-b[a.id]}));
+  const cardDebt=cards.reduce((s,x)=>s+x.amount,0);
+  return {cash,income,debt,early,earlySum,firstInc,cards,cardDebt,free:cash+income-debt-earlySum-cardDebt,days};
+}
+// Сколько покупок кредиткой в месяце покрыто погашениями: только покупки, сделанные не позже последнего погашения
+function coveredBuys(id,m){
+  const inM=S.tx.filter(t=>t.date.startsWith(m)),pays=inM.filter(t=>t.kind==="transfer"&&t.to===id);
+  if(!pays.length)return 0;
+  const last=pays.reduce((d,t)=>t.date>d?t.date:d,""),paid=pays.reduce((s,t)=>s+t.amount,0);
+  return Math.min(paid,inM.filter(t=>t.kind==="expense"&&t.acc===id&&t.date<=last).reduce((s,t)=>s+t.amount,0));
 }
 function cashFlow(m){
   const M=new Set(S.accounts.filter(a=>a.type==="cash"||a.type==="debit").map(a=>a.id));
@@ -323,7 +333,7 @@ function cashFlow(m){
   const cc=new Set(S.accounts.filter(a=>a.type==="credit").map(a=>a.id)),inM=S.tx.filter(t=>t.date.startsWith(m));
   r.cardBuys=inM.filter(t=>t.kind==="expense"&&cc.has(t.acc)).reduce((s,t)=>s+t.amount,0);
   const payCards=r.payCards=inM.filter(t=>t.kind==="transfer"&&M.has(t.acc)&&cc.has(t.to)).reduce((s,t)=>s+t.amount,0);
-  r.covered=Math.min(r.cardBuys,payCards);
+  r.covered=Math.min(payCards,[...cc].reduce((s,id)=>s+coveredBuys(id,m),0));
   r.spentAll=r.spent+r.cardBuys;r.debtNet=r.debt-r.covered;r.borrowed=r.cardBuys-r.covered;r.loans=r.debt-payCards;
   return r;
 }
@@ -362,6 +372,7 @@ function vHome(){
     <div class="kv tot"><b>${cur?"Сейчас":"На конец месяца"}</b><b class="num" style="font-size:18px">${money(cf.end)}</b></div>
     ${cp?`<div class="kv" style="margin-top:8px"><span>Придёт до конца месяца</span><b class="num pos">+${money(cp.income)}</b></div>
     ${cp.debt?`<div class="kv"><span>Уйдёт на кредиты до конца месяца</span><b class="num neg">${money(-cp.debt)}</b></div>`:""}
+    ${cp.cards.map(x=>`<div class="kv"><span>Погасить кредитку полностью: ${esc(x.name)}<div class="note">текущий долг, меняется с каждой покупкой</div></span><b class="num neg">${money(-x.amount)}</b></div>`).join("")}
     ${cp.early.map(x=>`<div class="kv"><span>${esc(shortDate(x.date))}: ${esc(x.name)}<div class="note">платёж раньше следующего дохода${cp.firstInc?` (${esc(shortDate(cp.firstInc))})`:""}, деньги нужно оставить</div></span><b class="num neg">${money(-x.amount)}</b></div>`).join("")}
     <div class="kv tot"><b>Свободно на жизнь до конца месяца</b><b class="num ${cp.free<0?"neg":"pos"}" style="font-size:18px">${money(cp.free)}</b></div>
     <div class="note">${cp.free>0?`Это примерно ${esc(money(cp.free/cp.days))} в день на ${cp.days} дн., включая сегодня.`:`<span class="neg">Денег до конца месяца не хватает на обязательные платежи.</span>`}</div>`:""}
@@ -586,7 +597,7 @@ function mbCredits(m){
   // Покупки кредиткой в этом месяце уже есть в расходах. Платёж по кредитке их покрывает,
   // поэтому в «Кредиты» идёт только то, что сверх них (старый долг), иначе покупки считаются дважды.
   S.accounts.filter(a=>a.type==="credit").forEach(a=>{
-    let buys=inMonth.filter(t=>t.kind==="expense"&&t.acc===a.id).reduce((s,t)=>s+t.amount,0);
+    let buys=coveredBuys(a.id,m);
     map.forEach(x=>{const y=x.by[a.id];if(y&&buys>0){const cut=Math.min(y.paid,buys);y.paid-=cut;buys-=cut}});
   });
   S.accounts.filter(isDebt).forEach(a=>{
@@ -594,9 +605,13 @@ function mbCredits(m){
     const paidNow=inMonth.some(t=>t.kind==="transfer"&&t.to===a.id);
     if(!past&&!covered&&!paidNow&&a.payment&&(b[a.id]||0)<-0.005)add(a.name,false,a.id,a.payment,0);
   });
+  // reg — план по регулярным платежам: что ещё спишется + уже оплаченный в этом месяце регулярный платёж (не больше его суммы).
+  // Досрочные погашения и разовые платежи (например, закрытие кредитки) в план не входят — это «сверх плана».
+  const regAmt=k=>live.filter(r=>k.startsWith("e:")?(r.kind==="expense"&&debtGroup(r.cat)&&"e:"+r.acc===k):(r.kind==="transfer"&&r.to===k)).reduce((s,r)=>s+r.amount,0);
   return [...map.values()].map(x=>{
-    const v=Object.values(x.by);
-    return {name:x.name,cat:x.cat,plan:v.reduce((s,y)=>s+y.plan,0),paid:v.reduce((s,y)=>s+y.paid,0),due:v.reduce((s,y)=>s+y.plan+y.paid,0)};
+    const e=Object.entries(x.by),v=e.map(([,y])=>y);
+    return {name:x.name,cat:x.cat,plan:v.reduce((s,y)=>s+y.plan,0),paid:v.reduce((s,y)=>s+y.paid,0),due:v.reduce((s,y)=>s+y.plan+y.paid,0),
+      reg:e.reduce((s,[k,y])=>s+y.plan+Math.min(y.paid,regAmt(k)),0)};
   });
 }
 function vMb(){
@@ -664,6 +679,182 @@ function spendIn(cat){
   if(S.month<today().slice(0,7))draft.date=S.month+"-"+pad(new Date(+S.month.slice(0,4),+S.month.slice(5),0).getDate());
   txSheet();
 }
+
+/* ---------- Графики ---------- */
+// Цвета серий заданы в index.html (--s-inc, --s-exp, --s-debt) и проверены на дальтонизм и контраст для обеих тем.
+const kfmt=v=>{const a=Math.abs(v);return (v<0?"−":"")+(a>=1000?nf.format(Math.round(a/1000))+" тыс":nf.format(Math.round(a)))};
+const ru=m=>monthName(m,true).replace(".","");
+// столбик со скруглённым верхом, низ прямой (лежит на оси)
+function barPath(x,y,w,h){
+  if(h<=0)return "";const r=Math.min(4,w/2,h);
+  return `M${x},${y+h}V${y+r}Q${x},${y} ${x+r},${y}H${x+w-r}Q${x+w},${y} ${x+w},${y+r}V${y+h}Z`;
+}
+function legend(items){
+  return `<div class="legend cl">${items.map(([v,l,dash])=>`<span><i class="sw ${dash?"dash":""}" style="--c:var(${v})"></i>${esc(l)}</span>`).join("")}</div>`;
+}
+function tableView(head,rows){
+  return `<details class="tv"><summary>Таблица</summary><div class="tw"><table><thead><tr>${head.map(h=>`<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${
+    rows.map(r=>`<tr>${r.map((c,i)=>`<td class="${i?"num":""}">${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody></table></div></details>`;
+}
+// 1. Приход и расход по месяцам: доходы, расходы, на кредиты; в текущем месяце пунктиром — что ещё ожидается
+function chartMonths(){
+  const cur=ym(new Date()),ms=[];for(let i=5;i>=0;i--)ms.push(shiftMonth(S.month,-i));
+  const cp=ms.includes(cur)?cashPlan():null;
+  const data=ms.map(m=>{const st=monthStats(m),cf=cashFlow(m),now=m===cur&&cp;
+    return {m,inc:st.income,exp:st.expense,debt:cf.debtNet,incRest:now?cp.income:0,debtRest:now?cp.debt+cp.cardDebt:0}});
+  const top=Math.max(1,...data.map(d=>Math.max(d.inc+d.incRest,d.exp,d.debt+d.debtRest)));
+  const step=[1e3,5e3,1e4,2e4,25e3,5e4,1e5,2e5,25e4,5e5,1e6].find(s=>top/s<=4)||1e6,ymax=Math.ceil(top/step)*step;
+  const W=340,H=190,L=42,R=4,T=10,B=22,pw=W-L-R,ph=H-T-B,gw=pw/data.length,bw=Math.min(14,(gw-10)/3);
+  const y=v=>T+ph-v/ymax*ph,hh=v=>v/ymax*ph;
+  let g="";
+  for(let v=0;v<=ymax;v+=step)g+=`<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" class="grid"/><text x="${L-6}" y="${y(v)+3}" text-anchor="end">${esc(kfmt(v))}</text>`;
+  data.forEach((d,i)=>{
+    const x0=L+i*gw+(gw-(bw*3+4))/2,xs=[x0,x0+bw+2,x0+2*bw+4];
+    const bar=(x,v,c)=>`<path d="${barPath(x,y(v),bw,hh(v))}" fill="var(${c})"/>`;
+    // ожидаемое — пунктирный контур над фактом
+    const rest=(x,v,base,c)=>v>0?`<rect x="${x+.75}" y="${y(base+v)+.75}" width="${bw-1.5}" height="${Math.max(0,hh(v)-2.5)}" rx="3" fill="none" stroke="var(${c})" stroke-width="1.5" stroke-dasharray="3 2"/>`:"";
+    g+=bar(xs[0],d.inc,"--s-inc")+rest(xs[0],d.incRest,d.inc,"--s-inc")+bar(xs[1],d.exp,"--s-exp")+bar(xs[2],d.debt,"--s-debt")+rest(xs[2],d.debtRest,d.debt,"--s-debt");
+    g+=`<text x="${L+i*gw+gw/2}" y="${H-6}" text-anchor="middle">${esc(ru(d.m))}</text>`;
+    const tip=[`${monthName(d.m)}`,`Доходы: ${money(d.inc)}${d.incRest?` (+${money(d.incRest)} ожидается)`:""}`,`Расходы: ${money(d.exp)}`,`На кредиты: ${money(d.debt)}${d.debtRest?` (+${money(d.debtRest)} ожидается)`:""}`].join("\n");
+    g+=`<rect class="hit" x="${L+i*gw}" y="${T}" width="${gw}" height="${ph}" data-tip="${esc(tip)}" tabindex="0" role="img" aria-label="${esc(tip.replace(/\n/g,", "))}"/>`;
+  });
+  return `<h2>Приход и расход по месяцам</h2><div class="card">${legend([["--s-inc","Доходы"],["--s-exp","Расходы"],["--s-debt","На кредиты"]].concat(cp?[["--muted","ещё ожидается",1]]:[]))}
+    <svg class="chart" viewBox="0 0 ${W} ${H}" width="100%" aria-label="Доходы, расходы и платежи по кредитам за 6 месяцев">${g}</svg>
+    <div class="note">«На кредиты» — без покупок кредиткой, они уже в расходах. Нажмите на месяц, чтобы увидеть суммы.</div>
+    ${tableView(["Месяц","Доходы","Расходы","На кредиты"],data.map(d=>[monthName(d.m),money(d.inc+d.incRest)+(d.incRest?" *":""),money(d.exp),money(d.debt+d.debtRest)+(d.debtRest?" *":"")]))}
+    ${cp?`<div class="note">* с учётом того, что ещё ожидается в этом месяце.</div>`:""}</div>`;
+}
+// 2. Деньги на картах по дням текущего месяца: факт до сегодня, дальше — по расписанию доходов и платежей по кредитам
+function chartCash(){
+  const m=ym(new Date()),M=moneyIds(),t0=today(),end=monthEnd(m),dim=pd(end).getDate(),day=new Date().getDate();
+  const cf=cashFlow(m),pts=[];let bal=cf.start;
+  const delta=t=>{const f=M.has(t.acc),to=t.kind==="transfer"&&M.has(t.to);
+    return t.kind==="income"&&f?t.amount:t.kind==="expense"&&f?-t.amount:t.kind==="transfer"?(to?t.amount:0)-(f?t.amount:0):0};
+  const byDay={};S.tx.filter(t=>t.date.startsWith(m)).forEach(t=>{const d=+t.date.slice(8);byDay[d]=(byDay[d]||0)+delta(t)});
+  for(let d=1;d<=day;d++){bal+=byDay[d]||0;pts.push({d,v:bal,fact:true})}
+  const sched={};S.recurring.filter(r=>r.active&&M.has(r.acc)).forEach(r=>{
+    let x=r.next,c=0;while(x<=end&&c<60){if(r.end&&x>r.end)break;
+      if(x>t0){const dd=+x.slice(8);const v=r.kind==="income"&&!isRefund(r.cat)?r.amount:isDebtPay(r,M)?-r.amount:0;if(v)(sched[dd]=sched[dd]||[]).push([r.kind==="income"?(r.note||r.cat):accName(r.to)||r.cat,v])}
+      x=advance(x,r.freq,r.anchor);c++}
+  });
+  for(let d=day+1;d<=dim;d++){(sched[d]||[]).forEach(([,v])=>bal+=v);pts.push({d,v:bal,fact:false,ev:sched[d]})}
+  const vs=pts.map(p=>p.v).concat(0),mn=Math.min(...vs),mx=Math.max(...vs),span=(mx-mn)||1;
+  const W=340,H=170,L=42,R=8,T=12,B=22,pw=W-L-R,ph=H-T-B;
+  const x=d=>L+(d-1)/(dim-1)*pw,y=v=>T+(1-(v-mn)/span)*ph;
+  const line=a=>a.map(p=>`${x(p.d).toFixed(1)},${y(p.v).toFixed(1)}`).join(" ");
+  const fact=pts.filter(p=>p.fact),fut=[fact[fact.length-1],...pts.filter(p=>!p.fact)];
+  let g=`<line x1="${L}" x2="${W-R}" y1="${y(0)}" y2="${y(0)}" class="zero"/><text x="${L-6}" y="${y(0)+3}" text-anchor="end">0</text>
+    <text x="${L-6}" y="${y(mx)+3}" text-anchor="end">${esc(kfmt(mx))}</text>${mn<0?`<text x="${L-6}" y="${y(mn)+3}" text-anchor="end">${esc(kfmt(mn))}</text>`:""}
+    <polyline points="${line(fact)}" fill="none" stroke="var(--s-inc)" stroke-width="2" stroke-linejoin="round"/>
+    ${fut.length>1?`<polyline points="${line(fut)}" fill="none" stroke="var(--s-inc)" stroke-width="2" stroke-dasharray="4 3" stroke-linejoin="round"/>`:""}
+    <circle cx="${x(day)}" cy="${y(fact[fact.length-1].v)}" r="4" fill="var(--s-inc)" stroke="var(--surface)" stroke-width="2"/>
+    ${[1,day,dim].filter((d,i,a)=>a.indexOf(d)===i&&(d===day||Math.abs(d-day)>3)).map(d=>`<text x="${x(d)}" y="${H-6}" text-anchor="middle">${d===day?"сегодня":d}</text>`).join("")}
+    <line class="xh" x1="0" x2="0" y1="${T}" y2="${T+ph}" visibility="hidden"/><circle class="xd" r="4" fill="var(--s-inc)" stroke="var(--surface)" stroke-width="2" visibility="hidden"/>
+    <rect class="hit" x="${L}" y="${T}" width="${pw}" height="${ph}" tabindex="0" aria-label="Остаток на картах по дням"/>`;
+  const json=esc(JSON.stringify(pts.map(p=>[p.d,Math.round(p.v*100)/100,p.fact?1:0,(p.ev||[]).map(e=>e[0]+" "+(e[1]>0?"+":"−")+nf.format(Math.abs(e[1]))).join(", ")])));
+  const last=pts[pts.length-1].v,low=pts.filter(p=>!p.fact).reduce((a,p)=>p.v<a.v?p:a,{v:Infinity}),neg=pts.filter(p=>!p.fact&&p.v<-0.005);
+  return `<h2>Деньги на картах, ${esc(monthName(m))}</h2><div class="card">${legend([["--s-inc","факт"],["--s-inc","по расписанию",1]])}
+    <svg class="chart" data-line="${json}" data-geo="${[L,pw,T,ph,mn,span,dim].join(",")}" viewBox="0 0 ${W} ${H}" width="100%" aria-label="Деньги на картах по дням">${g}</svg>
+    <div class="note">Пунктир — только доходы и платежи по кредитам по расписанию, без повседневных трат. На конец месяца по расписанию: <b class="num">${money(last)}</b>.${neg.length?` <span class="neg">По расписанию на карте будет минус ${esc(neg.map(p=>p.d).join(", "))}-го (до ${esc(money(low.v))}): платежи по кредитам списываются раньше, чем приходят деньги. Оставьте на эти дни запас или перенесите траты.</span>`:""}</div>
+    ${tableView(["День","На картах",""],pts.filter(p=>p.fact?byDay[p.d]||p.d===day||p.d===1:p.ev).map(p=>[`${p.d} ${monthName(m,true)}`,money(p.v),p.fact?"факт":(p.ev||[]).map(e=>e[0]).join(", ")]))}</div>`;
+}
+// Кредитные карты — счета типа «кредитка» без регулярного платежа по графику (у рассрочек он есть, они идут в «Кредиты»)
+function cardStats(m){
+  const cur=ym(new Date()),live=S.recurring.filter(r=>r.active);
+  return S.accounts.filter(a=>a.type==="credit"&&!live.some(r=>r.kind==="transfer"&&r.to===a.id)).map(a=>{
+    const eff=t=>t.kind==="income"&&t.acc===a.id?t.amount:t.kind==="expense"&&t.acc===a.id?-t.amount:t.kind==="transfer"?(t.to===a.id?t.amount:0)-(t.acc===a.id?t.amount:0):0;
+    let bal=a.initial||0;S.tx.forEach(t=>{if(t.date<m+"-01")bal+=eff(t)});
+    const inM=S.tx.filter(t=>t.date.startsWith(m));
+    const buys=inM.filter(t=>t.kind==="expense"&&t.acc===a.id).reduce((s,t)=>s+t.amount,0);
+    const cashOut=inM.filter(t=>t.kind==="transfer"&&t.acc===a.id).reduce((s,t)=>s+t.amount,0);
+    const refunds=inM.filter(t=>t.kind==="income"&&t.acc===a.id).reduce((s,t)=>s+t.amount,0);
+    const paid=inM.filter(t=>t.kind==="transfer"&&t.to===a.id).reduce((s,t)=>s+t.amount,0);
+    const startDebt=Math.max(0,-bal),endDebt=Math.max(0,-(bal-buys-cashOut+refunds+paid));
+    // план погашения на месяц — закрыть кредитку полностью: долг на 1-е + покупки − возвраты. Меняется с каждой покупкой.
+    const need=Math.max(0,startDebt+buys+cashOut-refunds);
+    return {a,startDebt,buys:buys+cashOut,refunds,paid,endDebt,need,net:paid-coveredBuys(a.id,m)};
+  }).filter(c=>c.startDebt||c.buys||c.paid||c.endDebt);
+}
+function cardBlock(m,row){
+  const cur=ym(new Date()),cs=cardStats(m);if(!cs.length)return {h:"",rows:[],net:0};
+  let h="",rows=[];
+  cs.forEach(c=>{
+    const nm=c.a.name,first=pd(m+"-01").toLocaleDateString("ru-RU",{day:"numeric",month:"long"});
+    h+=`<div class="pfsep">Кредитная карта: ${esc(nm)}</div>
+      <div class="kv"><span>Долг на ${esc(first)}</span><b class="num">${money(c.startDebt)}</b></div>
+      ${c.buys?`<div class="kv"><span>Покупки кредиткой</span><b class="num neg">+${money(c.buys)}</b></div>`:""}
+      ${c.refunds?`<div class="kv"><span>Возвраты на кредитку</span><b class="num pos">${money(-c.refunds)}</b></div>`:""}
+      ${c.paid?`<div class="kv"><span>Погашено с карты<div class="note">из них покупки этого месяца ${esc(money(c.paid-c.net))}, старый долг ${esc(money(c.net))}</div></span><b class="num pos">${money(-c.paid)}</b></div>`:""}
+      <div class="kv tot"><b>${c.endDebt>0.005?(m===cur?"Осталось погасить до 0":"Не погашено на конец месяца"):"Кредитка погашена полностью"}</b><b class="num ${c.endDebt>0.005?"neg":"pos"}">${money(c.endDebt)}</b></div>
+      ${row("Погашение кредитки",c.paid,c.need,"--s-debt",Math.max(c.need,c.paid,1),true)}
+      <div class="note">План — закрыть кредитку полностью: долг на 1-е + покупки − возвраты. Каждая новая покупка кредиткой увеличивает сумму к погашению${m===cur&&c.endDebt>0.005?", и она уже вычтена из «свободно на жизнь»":""}.</div>`;
+    rows.push([`${nm}: долг на 1-е`,money(c.startDebt),""],[`${nm}: покупки`,money(c.buys),""],[`${nm}: погашено`,money(c.paid),money(c.need)],[`${nm}: осталось погасить`,money(c.endDebt),""]);
+  });
+  return {h,rows,net:cs.reduce((s,c)=>s+c.net,0)};
+}
+// 3. План и факт за выбранный месяц: доходы, кредиты, кредитная карта, категории с лимитами
+function chartPlanFact(){
+  const m=S.month,cur=ym(new Date()),st=monthStats(m),lims=S.settings.limits||{};
+  const from=m===cur?today():m+"-01",past=m<cur;
+  const incDue=past?0:S.recurring.filter(r=>r.active&&r.kind==="income"&&!isRefund(r.cat)).reduce((s,r)=>s+occIn(r,from,monthEnd(m)),0);
+  const credits=mbCredits(m),cPaid=credits.reduce((s,c)=>s+c.paid,0),cPlan=credits.reduce((s,c)=>s+c.reg,0),cDue=credits.reduce((s,c)=>s+c.due,0);
+  const row=(name,fact,plan,c,max,good)=>{
+    const over=plan>0&&fact>plan+0.005,pw=plan?plan/max*100:0,fw=Math.min(100,fact/max*100);
+    const tip=`${name}\nфакт ${money(fact)}${plan?` из плана ${money(plan)}`:""}${over?`\nсверх плана ${money(fact-plan)}`:plan?`\nосталось ${money(plan-fact)}`:""}`;
+    return `<div class="pf" data-tip="${esc(tip)}" tabindex="0"><div class="h"><span>${esc(name)}</span><span class="num muted">${money(fact)}${plan?` из ${nf.format(Math.round(plan))}`:""}</span></div>
+      <div class="pfb"><i class="pl" style="width:${pw}%"></i><i class="fc" style="width:${fw}%;--c:var(${c})"></i>${plan?`<i class="tk" style="left:${pw}%"></i>`:""}</div>
+      ${over?`<div class="s ${good?"pos":"neg"}">${good?"больше плана":"сверх плана"} на ${esc(money(fact-plan))}</div>`:""}</div>`;
+  };
+  const top=Math.max(st.income+incDue,st.income,cPlan,cPaid,1);
+  // погашение кредитки показываем отдельным блоком, в «досрочно» остаются только кредиты
+  const cb=cardBlock(m,row),cRest=cDue-cPaid,cRegPaid=credits.reduce((s,c)=>s+c.reg-c.plan,0),cExtra=cPaid-cRegPaid-cb.net;
+  let h=`<h2>План и факт, ${esc(monthName(m))}</h2><div class="card">${legend([["--s-inc","доходы"],["--s-debt","кредиты"],["--s-exp","расходы"],["--line","план"]])}`;
+  h+=row("Доходы",st.income,past?0:st.income+incDue,"--s-inc",top,true)+(past?row("Кредиты",cPaid,0,"--s-debt",top,false):row("Кредиты по графику",cRegPaid,cPlan,"--s-debt",top,false))+
+    (!past&&cExtra>0.005?row("Кредиты досрочно и разово (вне плана)",cExtra,0,"--s-debt",top,false):"")+cb.h;
+  const cats=Object.keys(lims).filter(c=>num(lims[c])>0&&!DEBT_CAT.test(c)).sort((a,b)=>num(lims[b])-num(lims[a]));
+  const free=Object.entries(st.cats).filter(([c])=>!cats.includes(c)&&!DEBT_CAT.test(c));
+  if(cats.length||free.length){
+    const cmax=Math.max(1,...cats.map(c=>Math.max(num(lims[c]),st.cats[c]||0)),...free.map(([,v])=>v));
+    h+=`<div class="pfsep">Расходы по категориям</div>`+cats.map(c=>row(c,st.cats[c]||0,num(lims[c]),"--s-exp",cmax,false)).join("")+
+      free.sort((a,b)=>b[1]-a[1]).map(([c,v])=>row(c+" (без лимита)",v,0,"--s-exp",cmax,false)).join("");
+  }
+  h+=`<div class="note">Серая полоса — план (для доходов — пришло и ещё придёт, для кредитов — только регулярные платежи месяца), цветная — факт.${!past&&cRest>0.005?` По кредитам ещё спишется ${esc(money(cRest))}.`:""}</div>`;
+  h+=tableView(["Статья","Факт","План"],[["Доходы",money(st.income),past?"—":money(st.income+incDue)],...(past?[["Кредиты",money(cPaid),"—"]]:[["Кредиты по графику",money(cRegPaid),money(cPlan)]].concat(cExtra>0.005?[["Кредиты досрочно и разово",money(cExtra),"вне плана"]]:[])),...cb.rows]
+    .concat(cats.map(c=>[c,money(st.cats[c]||0),money(num(lims[c]))]),free.map(([c,v])=>[c,money(v),"без лимита"])));
+  return h+`</div>`;
+}
+function vCharts(){
+  if(!S.accounts.length)return `<div class="card empty"><b>Пока нечего показать</b>Добавьте счета и операции, и здесь появятся графики.</div>`;
+  return chartMonths()+(S.month===ym(new Date())?chartCash():"")+chartPlanFact();
+}
+// Подсказки: один всплывающий блок для всех [data-tip]; на графике денег по дням — перекрестие по ближайшему дню
+function tipShow(text,x,y){
+  const t=g("tip");t.textContent="";text.split("\n").forEach((l,i)=>{const d=document.createElement(i?"div":"b");d.textContent=l;t.appendChild(d)});
+  t.hidden=false;const r=t.getBoundingClientRect();
+  t.style.left=Math.max(8,Math.min(innerWidth-r.width-8,x-r.width/2))+"px";t.style.top=Math.max(8,y-r.height-14)+"px";
+}
+const tipHide=()=>{const t=g("tip");if(t)t.hidden=true;document.querySelectorAll(".chart .xh,.chart .xd").forEach(e=>e.setAttribute("visibility","hidden"))};
+function onTip(e){
+  const svg=e.target.closest&&e.target.closest("svg[data-line]");
+  if(svg&&e.clientX!=null){
+    const pts=JSON.parse(svg.dataset.line),[L,pw,T,ph,mn,span,dim]=svg.dataset.geo.split(",").map(Number);
+    const box=svg.getBoundingClientRect(),sx=box.width/svg.viewBox.baseVal.width;
+    const d=Math.max(1,Math.min(dim,Math.round(((e.clientX-box.left)/sx-L)/pw*(dim-1))+1)),p=pts.find(q=>q[0]===d);if(!p)return;
+    const px=L+(d-1)/(dim-1)*pw,py=T+(1-(p[1]-mn)/span)*ph;
+    svg.querySelector(".xh").setAttribute("x1",px);svg.querySelector(".xh").setAttribute("x2",px);svg.querySelector(".xh").setAttribute("visibility","visible");
+    const dot=svg.querySelector(".xd");dot.setAttribute("cx",px);dot.setAttribute("cy",py);dot.setAttribute("visibility","visible");
+    tipShow(`${money(p[1])}\n${d} ${monthName(ym(new Date()),true)} · ${p[2]?"факт":"по расписанию"}${p[3]?"\n"+p[3]:""}`,box.left+px*sx,box.top+py*sx);
+    return;
+  }
+  const el=e.target.closest&&e.target.closest("[data-tip]");
+  if(!el){tipHide();return}
+  const r=el.getBoundingClientRect();tipShow(el.dataset.tip,e.clientX??r.left+r.width/2,(e.clientY??r.top)-4);
+}
+document.addEventListener("pointermove",onTip);
+document.addEventListener("pointerdown",onTip);
+document.addEventListener("focusin",onTip);
+document.addEventListener("focusout",tipHide);
+document.addEventListener("scroll",tipHide,{passive:true});
 
 /* ---------- Ещё ---------- */
 function vMore(){

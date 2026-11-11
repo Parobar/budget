@@ -17,17 +17,20 @@
   --bg:#F2F4F1; --surface:#FFFFFF; --ink:#16231F; --muted:#64726C; --line:#DCE2DD;
   --accent:#0E6B57; --accent-ink:#FFFFFF; --accent-soft:#DCEEE8;
   --neg:#B0402E; --pos:#1F7A4A; --warn:#B7791F; --shade:rgba(10,20,16,.45);
+  --s-inc:#2a78d6; --s-exp:#eb6834; --s-debt:#1baf7a;
   --f-body:"Onest",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
   --f-display:"Unbounded","Onest",system-ui,sans-serif;
 }
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
   --bg:#101715; --surface:#18221F; --ink:#E7EEEA; --muted:#94A39C; --line:#2A3833;
   --accent:#4CC2A1; --accent-ink:#08201A; --accent-soft:#1D3A32;
-  --neg:#EE8B79; --pos:#6CCB93; --warn:#E0B25C; --shade:rgba(0,0,0,.6); color-scheme:dark}}
+  --neg:#EE8B79; --pos:#6CCB93; --warn:#E0B25C; --shade:rgba(0,0,0,.6);
+  --s-inc:#3987e5; --s-exp:#d95926; --s-debt:#199e70; color-scheme:dark}}
 :root[data-theme="dark"]{
   --bg:#101715; --surface:#18221F; --ink:#E7EEEA; --muted:#94A39C; --line:#2A3833;
   --accent:#4CC2A1; --accent-ink:#08201A; --accent-soft:#1D3A32;
-  --neg:#EE8B79; --pos:#6CCB93; --warn:#E0B25C; --shade:rgba(0,0,0,.6); color-scheme:dark}
+  --neg:#EE8B79; --pos:#6CCB93; --warn:#E0B25C; --shade:rgba(0,0,0,.6);
+  --s-inc:#3987e5; --s-exp:#d95926; --s-debt:#199e70; color-scheme:dark}
 
 *{box-sizing:border-box}
 html,body{margin:0}
@@ -156,7 +159,32 @@ nav.tabs button{font-size:11.5px}
 .bi .ft .btn{flex:none}
 .kv.tot{align-items:center;border-top:1px solid var(--line);margin-top:6px;padding-top:12px}
 .kv.tot .big{font:600 clamp(22px,6.5vw,28px)/1.1 var(--f-display);letter-spacing:-.02em}
-@media (max-width:400px){nav.tabs button{font-size:10.5px}}
+@media (max-width:400px){nav.tabs button{font-size:10px;padding:8px 0}}
+.chart{display:block;overflow:visible;touch-action:pan-y}
+.chart text{fill:var(--muted);font:10px var(--f-body)}
+.chart .grid{stroke:var(--line);stroke-width:1}
+.chart .zero{stroke:var(--muted);stroke-width:1;opacity:.6}
+.chart .xh{stroke:var(--muted);stroke-width:1}
+.chart .hit{fill:transparent;cursor:pointer;outline:none}
+.chart .hit:focus-visible{stroke:var(--accent);stroke-width:1.5}
+.legend.cl{flex-wrap:wrap;gap:6px 14px;margin:0 0 8px}
+.legend.cl span::before{display:none}
+.sw{display:inline-block;width:12px;height:8px;border-radius:2px;background:var(--c);margin-right:6px;vertical-align:middle}
+.sw.dash{background:none;border:1.5px dashed var(--c)}
+.pf{padding:8px 0;border-top:1px solid var(--line);outline:none}.pf:first-of-type{border-top:0}
+.pf .h{display:flex;justify-content:space-between;gap:10px;font-size:14px;margin-bottom:6px}
+.pf .s{font-size:12px;margin-top:4px}
+.pfb{position:relative;height:10px}
+.pfb i{position:absolute;left:0;top:0;bottom:0;border-radius:3px}
+.pfb .pl{background:var(--line)}
+.pfb .fc{background:var(--c);top:2px;bottom:2px}
+.pfb .tk{width:2px;margin-left:-1px;top:-3px;bottom:-3px;background:var(--ink);border-radius:1px}
+.pfsep{font-size:12px;font-weight:600;color:var(--muted);margin:14px 0 2px;text-transform:uppercase;letter-spacing:.06em}
+.tv{margin-top:10px;font-size:13px}.tv summary{cursor:pointer;color:var(--accent);font-weight:600}
+.tw{overflow-x:auto}.tv table{width:100%;border-collapse:collapse;margin-top:8px}
+.tv th,.tv td{padding:5px 6px;border-bottom:1px solid var(--line);text-align:left}.tv td.num{text-align:right}
+#tip{position:fixed;z-index:40;background:var(--ink);color:var(--bg);padding:8px 10px;border-radius:10px;font-size:12px;line-height:1.4;max-width:260px;pointer-events:none;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+#tip b{font-size:13px}
 </style>
 </head>
 <body>
@@ -175,6 +203,7 @@ nav.tabs button{font-size:11.5px}
 <nav class="tabs"><div class="in" id="tabs">
   <button data-tab="budget">Бюджет</button>
   <button data-tab="home">Обзор</button>
+  <button data-tab="charts">Графики</button>
   <button data-tab="tx">Операции</button>
   <button data-tab="acc">Счета</button>
   <button data-tab="plan">Планы</button>
@@ -182,6 +211,7 @@ nav.tabs button{font-size:11.5px}
 </div></nav>
 <div id="overlay"></div>
 <div id="toast" hidden></div>
+<div id="tip" role="tooltip" hidden></div>
 <input type="file" id="imp-file" accept=".csv,text/csv,text/plain" hidden>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <script src="config.js"></script>
