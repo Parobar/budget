@@ -302,15 +302,23 @@ function vHome(){
   const now=new Date();
   if(S.month===ym(now)){
     const day=now.getDate(),dim=new Date(now.getFullYear(),now.getMonth()+1,0).getDate();
-    const proj=st.expense/day*dim;
-    const lims=S.settings.limits||{},limCats=Object.keys(lims).filter(c=>num(lims[c])>0);
-    const L=limCats.reduce((s,c)=>s+num(lims[c]),0),spentL=limCats.reduce((s,c)=>s+(st.cats[c]||0),0);
-    const sched=upcoming(dim-day).filter(r=>r.kind==="expense"||(r.kind==="transfer"&&S.accounts.find(a=>a.id===r.to&&isDebt(a)))).reduce((s,r)=>s+r.amount,0);
+    // Прогноз по лимитам, а не по темпу: разовые покупки (подарки, одежда) в начале месяца раздували «темп» в разы.
+    // Остаток считается по каждой категории, как на вкладке «Бюджет»: перерасход в одной не съедает лимит другой.
+    const lims=S.settings.limits||{},limCats=Object.keys(lims).filter(c=>num(lims[c])>0&&!DEBT_CAT.test(c));
+    const left=limCats.reduce((s,c)=>s+Math.max(0,num(lims[c])-(st.cats[c]||0)),0);
+    const over=limCats.filter(c=>(st.cats[c]||0)>num(lims[c])).map(c=>`${c} +${nf.format(Math.round(((st.cats[c]||0)-num(lims[c]))*100)/100)}`);
+    const free=Object.entries(st.cats).filter(([c])=>!limCats.includes(c)&&!DEBT_CAT.test(c)).reduce((s,[,v])=>s+v,0);
+    const forecast=limCats.reduce((s,c)=>s+Math.max(num(lims[c]),st.cats[c]||0),0)+free;
+    const daysLeft=dim-day+1;
+    const credit=upcoming(dim-day).filter(r=>(r.kind==="transfer"&&isDebtId(r.to))||(r.kind==="expense"&&DEBT_CAT.test(r.cat||""))).reduce((s,r)=>s+r.amount,0);
     h+=`<h2>Прогноз</h2><section class="card">
-      <div class="kv"><span>Расходы к концу месяца при текущем темпе</span><b class="num">${money(proj)}</b></div>
-      ${sched?`<div class="kv"><span>Запланированные платежи до конца месяца</span><b class="num">${money(sched)}</b></div>`:""}
-      ${L?`<div class="kv"><span>Осталось по лимитам</span><b class="num ${L-spentL<0?"neg":""}">${money(L-spentL)}</b></div>
-      <div class="kv"><span>Можно тратить в день</span><b class="num ${L-spentL<0?"neg":""}">${money(Math.max(0,(L-spentL)/(dim-day+1)))}</b></div>`:`<div class="note">Задайте лимиты на вкладке «Ещё», и здесь появится «сколько можно тратить в день».</div>`}
+      <div class="kv"><span>Потрачено с 1-го числа</span><b class="num">${money(st.expense)}</b></div>
+      ${limCats.length?`<div class="kv"><span>Осталось по лимитам</span><b class="num">${money(left)}</b></div>
+      <div class="kv"><span>Можно тратить в день (ещё ${daysLeft} дн.)</span><b class="num">${money(left/daysLeft)}</b></div>
+      <div class="kv"><span>Расходы к концу месяца, если уложиться в лимиты</span><b class="num">${money(forecast)}</b></div>
+      ${over.length?`<div class="note neg">Сверх лимита: ${esc(over.join(", "))} ₽</div>`:""}`
+      :`<div class="note">Задайте лимиты на вкладке «Ещё», и здесь появится «сколько можно тратить в день».</div>`}
+      ${credit?`<div class="kv"><span>Ещё платежи по кредитам до конца месяца</span><b class="num">${money(credit)}</b></div>`:""}
     </section>`;
   }
 
