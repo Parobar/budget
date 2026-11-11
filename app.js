@@ -488,17 +488,30 @@ function mbCredits(m){
   const inMonth=S.tx.filter(t=>t.date.startsWith(m));
   const debtIds=new Set(S.accounts.filter(isDebt).map(a=>a.id));
   const map=new Map(),b=balances();
-  const add=(name,cat,plan,paid)=>{const x=map.get(name)||{name,plan:0,paid:0,cat};x.plan+=plan;x.paid+=paid;map.set(name,x)};
+  // внутри группы считаем по каждому кредиту отдельно: досрочное погашение одного не отменяет платёж по другому
+  const add=(name,cat,acc,plan,paid)=>{
+    const x=map.get(name)||{name,cat,by:{}};const y=x.by[acc]||(x.by[acc]={plan:0,paid:0});
+    y.plan+=plan;y.paid+=paid;map.set(name,x);
+  };
+  // перевод без группы на кредит берёт группу из регулярного платежа на этот же счёт
+  const recGroup=to=>debtGroup((S.recurring.find(r=>r.kind==="transfer"&&r.to===to&&debtGroup(r.cat))||{}).cat);
   // ключ платежа: группа, если указана, иначе название счёта-кредита
-  const key=r=>r.kind==="expense"?(debtGroup(r.cat)?[r.cat,true]:null)
-    :(r.kind==="transfer"&&debtIds.has(r.to))?(debtGroup(r.cat)?[r.cat,true]:[accName(r.to),false]):null;
-  live.forEach(r=>{const k=key(r);if(k)add(k[0],k[1],pm(r),0)});
-  inMonth.forEach(t=>{const k=key(t);if(k)add(k[0],k[1],0,t.amount)});
+  const key=r=>{
+    if(r.kind==="expense")return debtGroup(r.cat)?[r.cat,true,"e:"+r.acc]:null;
+    if(r.kind!=="transfer"||!debtIds.has(r.to))return null;
+    const gr=debtGroup(r.cat)||recGroup(r.to);
+    return gr?[gr,true,r.to]:[accName(r.to),false,r.to];
+  };
+  live.forEach(r=>{const k=key(r);if(k)add(k[0],k[1],k[2],pm(r),0)});
+  inMonth.forEach(t=>{const k=key(t);if(k)add(k[0],k[1],k[2],0,t.amount)});
   S.accounts.filter(isDebt).forEach(a=>{
     const covered=S.recurring.some(r=>r.active&&(r.acc===a.id||r.to===a.id));
-    if(!past&&!covered&&a.payment&&(b[a.id]||0)<-0.005)add(a.name,false,a.payment,0);
+    if(!past&&!covered&&a.payment&&(b[a.id]||0)<-0.005)add(a.name,false,a.id,a.payment,0);
   });
-  return [...map.values()];
+  return [...map.values()].map(x=>{
+    const v=Object.values(x.by);
+    return {name:x.name,cat:x.cat,plan:v.reduce((s,y)=>s+y.plan,0),paid:v.reduce((s,y)=>s+y.paid,0),due:v.reduce((s,y)=>s+Math.max(y.plan,y.paid),0)};
+  });
 }
 function vMb(){
   const st=monthStats(S.month),lims=S.settings.limits||{},ro=S.readOnly;
@@ -507,7 +520,7 @@ function vMb(){
     .map(c=>{const lim=num(lims[c]),spent=st.cats[c]||0;return {c,lim,spent,left:lim-spent}});
   const free=Object.entries(st.cats).filter(([c])=>!items.some(x=>x.c===c)&&!creditCats.has(c)).sort((a,b)=>b[1]-a[1]);
   const income=S.month<ym(new Date())?st.income:Math.max(monthlyPlan().income,st.income);
-  const creditSum=credits.reduce((s,c)=>s+Math.max(c.plan,c.paid),0);
+  const creditSum=credits.reduce((s,c)=>s+c.due,0);
   const limSum=items.reduce((s,x)=>s+x.lim,0),over=items.reduce((s,x)=>s+Math.max(0,-x.left),0);
   const spent=items.reduce((s,x)=>s+x.spent,0),canSpend=items.reduce((s,x)=>s+Math.max(0,x.left),0);
   const freeSum=free.reduce((s,[,v])=>s+v,0);
@@ -546,7 +559,7 @@ function vMb(){
   </section>`;
 
   if(credits.length)h+=`<h2>Кредиты в этом месяце</h2><div class="card">`+credits.map(c=>
-    `<div class="kv"><span>${esc(c.name)}<div class="note">оплачено ${esc(money(c.paid))}</div></span><b class="num">${money(c.plan||c.paid)}</b></div>`).join("")+
+    `<div class="kv"><span>${esc(c.name)}<div class="note">оплачено ${esc(money(c.paid))}</div></span><b class="num">${money(c.due)}</b></div>`).join("")+
     `<div class="note" style="margin-top:6px">Платежи списываются сами по регулярным операциям.</div></div>`;
   return h;
 }
@@ -639,6 +652,12 @@ function txSheet(){
       <button class="btn" data-act="save-tx">Сохранить</button></div>
     ${d.id?`<p style="text-align:center;margin:12px 0 0"><button class="link" data-act="dup-tx">Дублировать на сегодня</button></p>`:""}`);
 }
+// Регулярная операция, которую закрывает этот ручной платёж: тот же счёт (или категория), та же сумма, дата рядом
+function planFor(t){
+  const days=(a,b)=>Math.abs((pd(a)-pd(b))/864e5);
+  return S.recurring.find(r=>r.active&&r.kind===t.kind&&(t.kind==="transfer"?r.to===t.to:(r.cat===t.cat&&r.acc===t.acc))
+    &&Math.abs(r.amount-t.amount)<=Math.max(1,r.amount*0.01)&&days(r.next,t.date)<=15&&!(r.end&&r.next>r.end))||null;
+}
 async function saveTx(){
   syncDraft();const d=draft;
   const amount=num(d.amount);
@@ -647,10 +666,15 @@ async function saveTx(){
   if(d.kind==="transfer"&&(!d.to||d.to===d.acc))return toast("Выберите два разных счёта");
   const rec={kind:d.kind,amount:Math.round(amount*100)/100,date:d.date,acc:d.acc,note:d.note.trim(),by:d.by||S.uid||""};
   if(d.kind==="transfer"){rec.to=d.to;rec.cat=isDebtId(d.to)?debtGroup(d.cat):""}else rec.cat=d.cat;
+  const plan=d.id?null:planFor(rec);
+  if(plan&&rec.kind==="transfer"&&!rec.cat)rec.cat=debtGroup(plan.cat);
   try{
     await api.saveTx(d.id,rec);lastAcc=d.acc;
+    // ручной платёж засчитывается вместо ближайшего регулярного, чтобы тот не списался второй раз
+    if(plan)await api.saveRec(plan.id,{...plan,next:advance(plan.next,plan.freq,plan.anchor)});
     if(!rec.date.startsWith(S.month))S.month=rec.date.slice(0,7);
-    closeSheet();toast(!d.id&&rec.kind==="expense"?`${rec.cat}: −${money(rec.amount)}`:"Сохранено");
+    closeSheet();toast(plan?`Засчитано в план. Следующий платёж: ${shortDate(advance(plan.next,plan.freq,plan.anchor))}`
+      :!d.id&&rec.kind==="expense"?`${rec.cat}: −${money(rec.amount)}`:"Сохранено");
   }catch(e){toast("Не удалось сохранить: "+(e.message||e.code))}
 }
 async function delTx(){
