@@ -266,10 +266,26 @@ function nwChart(){
     ${mn!==mx?`<text x="${W-R}" y="10" text-anchor="end">мин. ${esc(money(mn))}</text>`:""}
   </svg>`;
 }
+function cashFlow(m){
+  const M=new Set(S.accounts.filter(a=>a.type==="cash"||a.type==="debit").map(a=>a.id));
+  const r={start:S.accounts.filter(a=>M.has(a.id)).reduce((s,a)=>s+(a.initial||0),0),in:0,spent:0,debt:0,other:0};
+  S.tx.forEach(t=>{
+    const fromM=M.has(t.acc),toM=t.kind==="transfer"&&M.has(t.to);
+    let d=0;
+    if(t.kind==="income"&&fromM)d=t.amount;else if(t.kind==="expense"&&fromM)d=-t.amount;
+    else if(t.kind==="transfer")d=(toM?t.amount:0)-(fromM?t.amount:0);
+    if(!d)return;
+    if(t.date<m+"-01"){r.start+=d;return}
+    if(!t.date.startsWith(m))return;
+    if(t.kind==="income")r.in+=d;else if(t.kind==="expense")r.spent-=d;
+    else if(fromM&&isDebtId(t.to))r.debt+=t.amount;else r.other-=d;
+  });
+  r.end=r.start+r.in-r.spent-r.debt-r.other;
+  return r;
+}
 function vHome(){
   const b=balances(),w=worth(b),st=monthStats(S.month),pv=monthStats(shiftMonth(S.month,-1));
   if(!S.accounts.length)return `<div class="card empty"><b>Начните со счетов</b>Добавьте кошелёк, карту, накопления, кредитную карту или кредит. Остальное считается само.<div style="margin-top:14px"><button class="btn" data-act="add-acc">Добавить счёт</button></div></div>`;
-  const left=st.income-st.expense;
   let h=`<section class="card hero">
     <div><div class="lab">Чистый капитал</div><div class="big num ${w.net<0?"neg":""}">${money(w.net)}</div></div>
     <div class="trio">
@@ -279,24 +295,30 @@ function vHome(){
     </div></section>`;
   const bud=vBudget(false);
   if(bud)h+=`<h2>План на месяц</h2>`+bud.replace("</section>",`<button class="link" data-tab="plan" style="justify-self:start">Подробнее</button></section>`);
+  // Деньги на картах и наличными за месяц: было на 1-е, пришло, потрачено, ушло на кредиты, стало — сходится с остатком карты
+  const cf=cashFlow(S.month),cur=S.month===ym(new Date());
+  const onCredit=S.tx.filter(t=>t.kind==="expense"&&t.date.startsWith(S.month)&&isDebtId(t.acc)).reduce((s,t)=>s+t.amount,0);
+  const first=pd(S.month+"-01").toLocaleDateString("ru-RU",{day:"numeric",month:"long"});
+  const due=cur?(()=>{const n=new Date(),dim=new Date(n.getFullYear(),n.getMonth()+1,0).getDate();
+    return upcoming(dim-n.getDate()).filter(r=>r.kind==="income"&&!isRefund(r.cat)).reduce((s,r)=>s+r.amount,0)})():0;
   h+=`<h2>${esc(monthName(S.month))}</h2><section class="card hero">
     <div class="trio">
       <div><div class="lab">Доходы</div><div class="v num pos">${money(st.income)}</div>${delta(st.income,pv.income,false)}</div>
       <div><div class="lab">Расходы</div><div class="v num neg">${money(st.expense)}</div>${delta(st.expense,pv.expense,true)}</div>
-      <div><div class="lab">Доходы − расходы</div><div class="v num ${left<0?"neg":""}">${money(left)}</div></div>
+      <div><div class="lab">На кредиты</div><div class="v num">${money(st.debtPaid)}</div></div>
     </div>
-    ${st.income>0?`<div class="note">Откладывается: <b>${Math.round(left/st.income*100)}%</b> дохода${pv.income>0?` (в прошлом месяце ${Math.round((pv.income-pv.expense)/pv.income*100)}%)`:""}.</div>`:""}
+    ${onCredit?`<div class="note">Из расходов ${esc(money(onCredit))} оплачено кредиткой: с карт эти деньги уходят платежом по кредитке.</div>`:""}
     ${st.refund?`<div class="note">Возвраты (${esc(money(st.refund))}) не считаются доходом: денег от них не прибавилось, они только вернули потраченное.</div>`:""}
-    ${st.debtPaid?`<div class="note">Отправлено на погашение долгов: <span class="num">${money(st.debtPaid)}</span></div>`:""}
-    ${S.month===ym(new Date())?(()=>{
-      // «Доходы − расходы» — итог месяца, а не остаток на счетах: показываем рядом, сколько денег есть и сколько ещё придёт
-      const cash=S.accounts.filter(a=>a.type==="cash"||a.type==="debit").reduce((s,a)=>s+(b[a.id]||0),0);
-      const now=new Date(),dim=new Date(now.getFullYear(),now.getMonth()+1,0).getDate();
-      const due=upcoming(dim-now.getDate()).filter(r=>r.kind==="income"&&!isRefund(r.cat)).reduce((s,r)=>s+r.amount,0);
-      return `<div class="kv" style="border-top:1px solid var(--line);padding-top:10px"><span>Сейчас на картах и наличными</span><b class="num">${money(cash)}</b></div>
-      ${due?`<div class="kv"><span>Ещё придёт до конца месяца</span><b class="num pos">${money(due)}</b></div>`:""}`;
-    })():""}
-    <div class="note">«Доходы − расходы» — сколько за месяц пришло больше, чем ушло. Это не остаток на счетах. Стрелки показывают изменение к прошлому месяцу.</div>
+  </section>
+  <h2>Деньги на картах и наличными</h2><section class="card">
+    <div class="kv"><span>На ${esc(first)}</span><b class="num">${money(cf.start)}</b></div>
+    <div class="kv"><span>Пришло</span><b class="num pos">+${money(cf.in)}</b></div>
+    <div class="kv"><span>Потрачено с карт и наличными</span><b class="num neg">${money(-cf.spent)}</b></div>
+    ${cf.debt?`<div class="kv"><span>Ушло на кредиты</span><b class="num neg">${money(-cf.debt)}</b></div>`:""}
+    ${Math.abs(cf.other)>0.005?`<div class="kv"><span>Переводы на другие счета</span><b class="num ${cf.other>0?"neg":"pos"}">${cf.other>0?"":"+"}${money(-cf.other)}</b></div>`:""}
+    <div class="kv tot"><b>${cur?"Сейчас":"На конец месяца"}</b><b class="num" style="font-size:18px">${money(cf.end)}</b></div>
+    ${due?`<div class="kv"><span>Ещё придёт до конца месяца</span><b class="num pos">${money(due)}</b></div>`:""}
+    <div class="note">Стрелки у доходов и расходов показывают изменение к прошлому месяцу.</div>
   </section>`;
 
   const now=new Date();
